@@ -50,3 +50,11 @@
 - Added workflow `contents: write` permission so the existing `github.token` can create or update the Release from the successful manual build.
 - Kept the existing workflow triggers, smoke job, devcontainer image, debug build command, and build environment unchanged.
 - No Servo crates/modules or local-runtime Rust code were touched; no runtime resource paths were loaded, logged, or denied by this CI-only release capture change.
+
+## 2026-06-18 — local-runtime-devcontainer release upload repair
+
+- Inspected `.github/workflows/local-runtime-devcontainer-smoke.yml` release publishing path for the manual Linux debug build.
+- Touched workflow only; no Servo crates/modules changed.
+- Restored the release upload step to mark `$GITHUB_WORKSPACE` as a safe Git directory before invoking `gh release`, avoiding container ownership/safety failures in the devcontainer job.
+- No new resource paths, request origins, denial behavior, or host-provider seams discovered.
+- Open question: after the next `workflow_dispatch` run, confirm the release tag update succeeds in GitHub Actions and record any remaining CI-only failure mode.
