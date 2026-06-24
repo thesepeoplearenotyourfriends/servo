@@ -1,0 +1,62 @@
+name: Publish Severin Page Probe Shelf
+
+on:
+  workflow_run:
+    workflows:
+      - Warm Severin Page Probe Build
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download probe build output
+        uses: actions/download-artifact@v4
+        with:
+          name: severin-page-probe-linux-x86_64
+          path: probe-input
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Pack and publish probe shelf
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          TAG="severin-page-probe"
+          RELEASE_DIR="$RUNNER_TEMP/severin-page-probe-release"
+          ARCHIVE_NAME="severin-page-probe-linux-x86_64.tar.zst"
+          ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
+          CHECKSUM="$RELEASE_DIR/$ARCHIVE_NAME.sha256"
+
+          rm -rf "$RELEASE_DIR"
+          mkdir -p "$RELEASE_DIR"
+
+          test -f probe-input/severin.so
+          test -f probe-input/SEVERIN_PAGE_PROBE.diff
+          test -f probe-input/BUILD_INFO.txt
+
+          tar --zstd --create --file "$ARCHIVE" --directory probe-input .
+          sha256sum "$ARCHIVE" > "$CHECKSUM"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARCHIVE" "$CHECKSUM" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$TAG" "$ARCHIVE" "$CHECKSUM" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Severin page probe" \
+              --notes "Durable handoff shelf for the current warm Severin page-global probe build."
+          fi
+
+          echo "Published $TAG/$ARCHIVE_NAME"
+          cat "$CHECKSUM"
