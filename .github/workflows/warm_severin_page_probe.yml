@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 defaults:
   run:
@@ -281,13 +281,21 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           cargo build --release -p severin-python
 
-      - name: Package Severin page-probe artifact
+      - name: Package and publish Severin page-probe wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
 
-          ARTIFACT_DIR="${RUNNER_TEMP}/severin-page-probe-linux-x86_64"
-          rm -rf "$ARTIFACT_DIR"
-          mkdir -p "$ARTIFACT_DIR"
+          TAG="severin-page-probe"
+          WHEEL_NAME="severin-0.3.0+pageprobe-cp311-cp311-linux_x86_64.whl"
+          WHEEL_DIR="${RUNNER_TEMP}/severin-page-probe-wheel"
+          WHEEL_ROOT="$WHEEL_DIR/root"
+          WHEEL_PATH="$WHEEL_DIR/$WHEEL_NAME"
+          DIST_INFO="severin-0.3.0+pageprobe.dist-info"
+
+          rm -rf "$WHEEL_DIR"
+          mkdir -p "$WHEEL_ROOT/$DIST_INFO"
 
           mapfile -t extension_candidates < <(
             find "$CARGO_TARGET_DIR/release" -maxdepth 1 -type f \
@@ -301,23 +309,75 @@ jobs:
             exit 1
           fi
 
-          cp "${extension_candidates[0]}" "$ARTIFACT_DIR/severin.so"
-          git -C "$GITHUB_WORKSPACE" diff --no-ext-diff > "$ARTIFACT_DIR/SEVERIN_PAGE_PROBE.diff"
-          {
-            printf 'source_commit=%s\n' "$GITHUB_SHA"
-            printf 'extension_source=%s\n' "${extension_candidates[0]}"
-            printf 'probe_environment=SEVERIN_PROBE=1\n'
-          } > "$ARTIFACT_DIR/BUILD_INFO.txt"
-          sha256sum "$ARTIFACT_DIR/severin.so" > "$ARTIFACT_DIR/SHA256SUMS"
+          cp "${extension_candidates[0]}" \
+            "$WHEEL_ROOT/severin.cpython-311-x86_64-linux-gnu.so"
 
-          ls -l "$ARTIFACT_DIR"
-          cat "$ARTIFACT_DIR/BUILD_INFO.txt"
-          cat "$ARTIFACT_DIR/SHA256SUMS"
+          cat > "$WHEEL_ROOT/$DIST_INFO/METADATA" <<'EOF'
+          Metadata-Version: 2.1
+          Name: severin
+          Version: 0.3.0+pageprobe
+          Summary: Experimental CPython bindings for the Severin local Servo runtime, with page-global probe wiring.
+          EOF
 
-      - name: Upload Severin page-probe artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: severin-page-probe-linux-x86_64
-          path: ${{ runner.temp }}/severin-page-probe-linux-x86_64
-          if-no-files-found: error
-          retention-days: 7
+          cat > "$WHEEL_ROOT/$DIST_INFO/WHEEL" <<'EOF'
+          Wheel-Version: 1.0
+          Generator: severin-page-probe
+          Root-Is-Purelib: false
+          Tag: cp311-cp311-linux_x86_64
+          EOF
+
+          cat > "$WHEEL_ROOT/$DIST_INFO/SEVERIN_PAGE_PROBE.txt" <<EOF
+          source_commit=$GITHUB_SHA
+          extension_source=${extension_candidates[0]}
+          probe_environment=SEVERIN_PROBE=1
+          EOF
+
+          python3 - "$WHEEL_ROOT" "$WHEEL_PATH" <<'PY'
+          import base64
+          import hashlib
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          wheel_path = Path(sys.argv[2])
+          dist_infos = sorted(root.glob("*.dist-info"))
+          if len(dist_infos) != 1:
+              raise SystemExit(f"expected one dist-info directory, found {len(dist_infos)}")
+
+          record_name = f"{dist_infos[0].name}/RECORD"
+          files = sorted(
+              path for path in root.rglob("*")
+              if path.is_file() and path.relative_to(root).as_posix() != record_name
+          )
+
+          records = []
+          with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as wheel:
+              for path in files:
+                  arcname = path.relative_to(root).as_posix()
+                  data = path.read_bytes()
+                  digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+                  wheel.writestr(arcname, data)
+                  records.append(f"{arcname},sha256={digest},{len(data)}")
+              records.append(f"{record_name},,")
+              wheel.writestr(record_name, "\n".join(records) + "\n")
+          PY
+
+          python3 -m zipfile -t "$WHEEL_PATH"
+          ls -lh "$WHEEL_PATH"
+          python3 -m zipfile -l "$WHEEL_PATH"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$WHEEL_PATH" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$TAG" "$WHEEL_PATH" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Severin page probe" \
+              --notes "Current warm Severin page-global probe wheel."
+          fi
+
+          release_url="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+          echo "Probe wheel release: $release_url"
+          echo "Probe wheel asset:   $WHEEL_NAME"
