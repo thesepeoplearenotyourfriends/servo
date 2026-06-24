@@ -1,0 +1,483 @@
+name: Warm Severin Page Probe Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+  CC: clang
+  CXX: clang++
+  CARGO_TARGET_DIR: /var/servo-cargo-target
+  UV_PROJECT_ENVIRONMENT: .devcontainer-venv
+
+jobs:
+  warm-severin-page-probe:
+    name: Debian 12 warm Severin page probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    container:
+      image: debian:12
+
+    steps:
+      - name: Install restore bootstrap
+        run: |
+          set -Eeuo pipefail
+
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            git \
+            tar \
+            zstd \
+            gh \
+            python3
+
+      - name: Download and restore warm state
+        id: warm_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          WARM_TAG="factory-reset-debian12-ubuntu24-warm-state"
+          PIECES_DIR="${RUNNER_TEMP}/release-pieces"
+
+          rm -rf "$PIECES_DIR"
+          mkdir -p "$PIECES_DIR"
+
+          gh release download "$WARM_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$PIECES_DIR" \
+            --clobber \
+            --pattern 'SHA256SUMS'
+
+          mapfile -t expected_piece_names < <(
+            awk '{print $2}' "$PIECES_DIR/SHA256SUMS"
+          )
+
+          if [ "${#expected_piece_names[@]}" -eq 0 ]; then
+            echo "Warm release SHA256SUMS contains no archive pieces." >&2
+            exit 1
+          fi
+
+          for piece_name in "${expected_piece_names[@]}"; do
+            gh release download "$WARM_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$PIECES_DIR" \
+              --clobber \
+              --pattern "$piece_name"
+          done
+
+          (
+            cd "$PIECES_DIR"
+            sha256sum -c SHA256SUMS
+          )
+
+          mounted_targets() {
+            awk '$5 != "/" { print $5 }' /proc/self/mountinfo \
+              | while IFS= read -r encoded_path; do
+                  printf '%b\n' "$encoded_path"
+                done \
+              | sort -u
+          }
+
+          tar_excludes_for_destination() {
+            local destination="$1"
+            local mountpoint
+            local relative_path
+
+            while IFS= read -r mountpoint; do
+              if [ "$destination" = "/" ]; then
+                relative_path="${mountpoint#/}"
+              else
+                case "$mountpoint" in
+                  "$destination")
+                    continue
+                    ;;
+                  "$destination"/*)
+                    relative_path="${mountpoint#"$destination"/}"
+                    ;;
+                  *)
+                    continue
+                    ;;
+                esac
+              fi
+
+              [ -n "$relative_path" ] || continue
+              printf '%s\0' "--exclude=./$relative_path"
+            done < <(mounted_targets)
+          }
+
+          restore_stream() {
+            local stream_name="$1"
+            local destination="$2"
+            local first_piece="$PIECES_DIR/${stream_name}.part-000"
+            local tar_excludes=()
+            local exclude_arg
+
+            if [ ! -f "$first_piece" ]; then
+              echo "No ${stream_name} stream in warm state; skipping."
+              return 0
+            fi
+
+            while IFS= read -r -d '' exclude_arg; do
+              tar_excludes+=("$exclude_arg")
+            done < <(tar_excludes_for_destination "$destination")
+
+            echo "Restoring ${stream_name} into ${destination}"
+            cat "$PIECES_DIR"/"${stream_name}".part-* \
+              | tar --zstd \
+                  --numeric-owner \
+                  --acls \
+                  --xattrs \
+                  "${tar_excludes[@]}" \
+                  -xpf - \
+                  -C "$destination"
+          }
+
+          restore_stream debian-root.tar.zst /
+          restore_stream github-home.tar.zst "$HOME"
+
+          if [ -f "$PIECES_DIR/repo-worktree.tar.zst.part-000" ]; then
+            echo "has_repo_worktree=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_repo_worktree=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          test -d "$CARGO_TARGET_DIR"
+
+      - name: Restore warmed repository worktree
+        if: steps.warm_state.outputs.has_repo_worktree == 'true'
+        run: |
+          set -Eeuo pipefail
+
+          PIECES_DIR="${RUNNER_TEMP}/release-pieces"
+
+          echo "Restoring saved worktree into $GITHUB_WORKSPACE"
+          cat "$PIECES_DIR"/repo-worktree.tar.zst.part-* \
+            | tar --zstd \
+                --numeric-owner \
+                --acls \
+                --xattrs \
+                -xpf - \
+                -C "$GITHUB_WORKSPACE"
+
+          test -d "$GITHUB_WORKSPACE/.git"
+          test -f "$GITHUB_WORKSPACE/Cargo.toml"
+
+      - name: Checkout source when warm state has no worktree
+        if: steps.warm_state.outputs.has_repo_worktree != 'true'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Update restored source in place
+        if: steps.warm_state.outputs.has_repo_worktree == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          if git -C "$GITHUB_WORKSPACE" remote get-url origin >/dev/null 2>&1; then
+            git -C "$GITHUB_WORKSPACE" remote set-url origin \
+              "https://github.com/${GITHUB_REPOSITORY}.git"
+          else
+            git -C "$GITHUB_WORKSPACE" remote add origin \
+              "https://github.com/${GITHUB_REPOSITORY}.git"
+          fi
+
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+
+          git -C "$GITHUB_WORKSPACE" \
+            -c "http.extraheader=AUTHORIZATION: basic $auth" \
+            fetch --no-tags --depth=50 origin "$GITHUB_SHA"
+
+          current_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+
+          if [ "$current_sha" = "$GITHUB_SHA" ]; then
+            echo "Restored worktree already matches requested commit; preserving timestamps."
+          elif git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "Fast-forwarding restored worktree; unchanged files retain timestamps."
+            git -C "$GITHUB_WORKSPACE" merge --ff-only FETCH_HEAD
+          else
+            echo "Requested commit diverges from warm worktree; resetting source to requested commit."
+            git -C "$GITHUB_WORKSPACE" reset --hard FETCH_HEAD
+          fi
+
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Restore repo-local warm state
+        run: |
+          set -Eeuo pipefail
+
+          PIECES_DIR="${RUNNER_TEMP}/release-pieces"
+          first_piece="$PIECES_DIR/repo-warm.tar.zst.part-000"
+
+          if [ -f "$first_piece" ]; then
+            echo "Restoring repo-local warm state into $GITHUB_WORKSPACE"
+            cat "$PIECES_DIR"/repo-warm.tar.zst.part-* \
+              | tar --zstd \
+                  --numeric-owner \
+                  --acls \
+                  --xattrs \
+                  -xpf - \
+                  -C "$GITHUB_WORKSPACE"
+          else
+            echo "No repo-local warm state in this snapshot; continuing."
+          fi
+
+          test -d "$CARGO_TARGET_DIR"
+
+      - name: Reattach restored Rust toolchain
+        run: |
+          set -Eeuo pipefail
+
+          CARGO_HOME=/usr/local/cargo
+          RUSTUP_HOME=/usr/local/rustup
+          CARGO_BIN="$CARGO_HOME/bin"
+
+          if [ ! -x "$CARGO_BIN/cargo" ]; then
+            echo "Cargo was not restored at $CARGO_BIN/cargo." >&2
+            exit 1
+          fi
+
+          export CARGO_HOME RUSTUP_HOME
+          export PATH="$CARGO_BIN:$PATH"
+
+          printf '%s\n' "$CARGO_BIN" >> "$GITHUB_PATH"
+          {
+            printf 'CARGO_HOME=%s\n' "$CARGO_HOME"
+            printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME"
+          } >> "$GITHUB_ENV"
+
+          command -v cargo
+          cargo --version --verbose
+          command -v rustc
+          rustc --version --verbose
+
+      - name: Inject bounded page-global probe
+        run: |
+          set -Eeuo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          /usr/bin/python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("ports/severin-python/src/lib.rs")
+          probe_module = Path("ports/severin-python/src/bridge_probe.rs")
+          text = source.read_text()
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"SEVERIN_PROBE: expected one {label} anchor, found {count}")
+              return text.replace(old, new, 1)
+
+          text = replace_once(
+              text,
+              "mod bridge_trace;\n",
+              "mod bridge_trace;\nmod bridge_probe;\n",
+              "module declaration",
+          )
+          text = replace_once(
+              text,
+              "    trace_bridge: bool,\n    next_evaluation_id: u64,\n",
+              "    trace_bridge: bool,\n    probe_bridge: bool,\n    next_evaluation_id: u64,\n",
+              "EmbeddedServoApp field",
+          )
+          text = replace_once(
+              text,
+              "    active_document_id: Option<String>,\n",
+              "    active_document_id: Option<String>,\n    last_page_probe: Option<Option<String>>,\n",
+              "BridgeTransport field",
+          )
+          text = replace_once(
+              text,
+              """    fn clear_for_navigation(&mut self) {
+              self.inbound.clear();
+              self.pending.clear();
+              self.active_document_id = None;
+          }
+          """,
+              """    fn clear_for_navigation(&mut self) {
+              self.inbound.clear();
+              self.pending.clear();
+              self.active_document_id = None;
+              self.last_page_probe = None;
+          }
+          """,
+              "navigation clear",
+          )
+          text = replace_once(
+              text,
+              """    fn clear_for_close(&mut self) {
+              self.clear_for_navigation();
+          }
+          """,
+              """    fn clear_for_close(&mut self) {
+              self.clear_for_navigation();
+          }
+
+          fn observe_page_probe(&mut self, page_probe: Option<String>) -> bool {
+              if self.last_page_probe == Some(page_probe.clone()) {
+                  return false;
+              }
+              self.last_page_probe = Some(page_probe);
+              true
+          }
+          """,
+              "probe observer",
+          )
+          text = replace_once(
+              text,
+              """const DRAIN_SCRIPT: &str = r#"
+          (() => {
+            if (typeof globalThis.__severinDrain !== "function") {
+              return JSON.stringify({ documentId: null, frames: [] });
+            }
+            return JSON.stringify(globalThis.__severinDrain());
+          })()
+          "#;
+          """,
+              """const DRAIN_SCRIPT: &str = r#"
+          (() => {
+            const root = globalThis.document ? globalThis.document.documentElement : null;
+            const pageProbe = root ? root.getAttribute("data-severin-probe") : null;
+            if (typeof globalThis.__severinDrain !== "function") {
+              return JSON.stringify({ documentId: null, frames: [], pageProbe });
+            }
+            const drained = globalThis.__severinDrain();
+            return JSON.stringify({
+              documentId: drained.documentId,
+              frames: drained.frames,
+              pageProbe,
+            });
+          })()
+          "#;
+          """,
+              "drain script",
+          )
+          text = replace_once(
+              text,
+              """        bridge_trace::emit(
+              trace_bridge,
+              format_args!("app:new width={width} height={height}"),
+          );
+
+          let mut event_loop = EventLoop::with_user_event()
+          """,
+              """        bridge_trace::emit(
+              trace_bridge,
+              format_args!("app:new width={width} height={height}"),
+          );
+        let probe_bridge = bridge_probe::enabled();
+        bridge_probe::emit(format_args!("app:new page-global probe enabled"));
+
+          let mut event_loop = EventLoop::with_user_event()
+          """,
+              "probe initialization",
+          )
+          text = replace_once(
+              text,
+              """            pending_evaluations: Vec::new(),
+              trace_bridge,
+              next_evaluation_id: 0,
+          """,
+              """            pending_evaluations: Vec::new(),
+              trace_bridge,
+              probe_bridge,
+              next_evaluation_id: 0,
+          """,
+              "probe field initialization",
+          )
+          text = replace_once(
+              text,
+              """        let drained: serde_json::Value = serde_json::from_str(&serialized)
+              .map_err(|error| format!("invalid Severin bridge drain result: {error}"))?;
+          let document_id = drained
+          """,
+              """        let drained: serde_json::Value = serde_json::from_str(&serialized)
+              .map_err(|error| format!("invalid Severin bridge drain result: {error}"))?;
+        if self.probe_bridge {
+            let page_probe = drained
+                .get("pageProbe")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            if self.bridge_transport.observe_page_probe(page_probe.clone()) {
+                bridge_probe::emit(format_args!(
+                    "page-global={}",
+                    page_probe.as_deref().unwrap_or("<absent>")
+                ));
+            }
+        }
+        let document_id = drained
+          """,
+              "page-probe read",
+          )
+
+          source.write_text(text)
+          probe_module.write_text('''//! `SEVERIN_PROBE=1` diagnostics for page-visible bridge state.\n\n/// Opt-in environment variable for the bounded page-global probe.\npub(crate) const ENV: &str = "SEVERIN_PROBE";\n\npub(crate) fn enabled() -> bool {\n    match std::env::var(ENV) {\n        Ok(value) => !matches!(value.as_str(), "" | "0" | "false" | "FALSE" | "off" | "OFF"),\n        Err(_) => false,\n    }\n}\n\npub(crate) fn emit(message: std::fmt::Arguments<'_>) {\n    if enabled() {\n        eprintln!("SEVERIN_PROBE: {message}");\n    }\n}\n''')
+          print("SEVERIN_PROBE: native source injection complete")
+          PY
+
+          git diff --check
+          git diff --stat
+
+      - name: Build Severin page-probe extension
+        run: |
+          set -Eeuo pipefail
+          cd "$GITHUB_WORKSPACE"
+          cargo build --release -p severin-python
+
+      - name: Package Severin page-probe artifact
+        run: |
+          set -Eeuo pipefail
+
+          ARTIFACT_DIR="${RUNNER_TEMP}/severin-page-probe-linux-x86_64"
+          rm -rf "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+
+          mapfile -t extension_candidates < <(
+            find "$CARGO_TARGET_DIR/release" -maxdepth 1 -type f \
+              \( -name 'libseverin.so' -o -name 'severin*.so' \) \
+              -print | sort
+          )
+
+          if [ "${#extension_candidates[@]}" -ne 1 ]; then
+            printf 'Expected exactly one Severin extension; found %s:\n' "${#extension_candidates[@]}" >&2
+            printf '  %s\n' "${extension_candidates[@]:-<none>}" >&2
+            exit 1
+          fi
+
+          cp "${extension_candidates[0]}" "$ARTIFACT_DIR/severin.so"
+          git -C "$GITHUB_WORKSPACE" diff --no-ext-diff > "$ARTIFACT_DIR/SEVERIN_PAGE_PROBE.diff"
+          {
+            printf 'source_commit=%s\n' "$GITHUB_SHA"
+            printf 'extension_source=%s\n' "${extension_candidates[0]}"
+            printf 'probe_environment=SEVERIN_PROBE=1\n'
+          } > "$ARTIFACT_DIR/BUILD_INFO.txt"
+          sha256sum "$ARTIFACT_DIR/severin.so" > "$ARTIFACT_DIR/SHA256SUMS"
+
+          ls -l "$ARTIFACT_DIR"
+          cat "$ARTIFACT_DIR/BUILD_INFO.txt"
+          cat "$ARTIFACT_DIR/SHA256SUMS"
+
+      - name: Upload Severin page-probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: severin-page-probe-linux-x86_64
+          path: ${{ runner.temp }}/severin-page-probe-linux-x86_64
+          if-no-files-found: error
+          retention-days: 7
