@@ -936,3 +936,39 @@ Everything else gets no phone line.
 - Added the required no-op `ApplicationHandler::window_event` implementation for the temporary `WinitBootstrap` handler in `ports/severin-python/src/lib.rs` after CI build output showed Winit requires the trait item.
 - The handler intentionally has no runtime event policy: bootstrap only creates the native window and `WindowRenderingContext`; the later `WinitPump` continues to own close/redraw/resize processing during `App.pump()`.
 - No resource loading behavior, workflow file, IPC path, helper process, socket, HTTP/WebSocket path, or presentation architecture was changed.
+
+## 2026-06-25 — Severin Python bridge transport hardening source pass
+
+- Completed a source-only pass over the five transport-hardening areas requested for the Severin Python bridge: finite default/override limits, bounded page-to-Python admission, opaque one-shot generation-scoped receipts, tiny transport error separation from application JSON, and terminal navigation/close boundaries with a diagnostic ledger.
+- Touched `ports/severin-python/src/lib.rs` and the temporary `.github/scripts/inject_severin_page_probe.py` probe injector. No Servo build, runtime, test environment, external runner, or probe execution was attempted in this pass.
+- Added the default physical bridge envelope: `max_frame_bytes` 1 MiB, `max_live_receipts` 128, `max_queued_frames` 128, `max_queued_bytes` 8 MiB, `messages_per_second` 256, `message_burst` 128, `bytes_per_second` 8 MiB, `byte_burst` 2 MiB, and `max_deliveries_per_pump` 32.
+- Added optional Python-owned partial `bridge_limits=` overrides at `App` construction. Omitted values inherit defaults; unknown and invalid values fail during construction; limits remain fixed for the App lifetime.
+- Preserved the payload-neutral rule: Rust checks JSON validity, serialized UTF-8 size, mailbox capacity, rate/burst state, active generation, receipt state, and closure state only. It does not infer image/blob/file/media/stream semantics or inspect application fields.
+- Made navigation and close explicit terminal boundaries for bridge state: unread frames are discarded, receipts are invalidated, document generation advances on navigation, and closed App operations use the closed-App path.
+- Added a debug ledger surface, `bridge_debug_state()`, reporting current document generation, effective limits, current queue/live counts, last pump delivery count, App-lifetime rejection counters, stale reply rejection count, and App-lifetime peak counts.
+- Updated the temporary probe injector anchors for the bounded drain path and method-table growth so follow-up probe coverage can assert default construction, partial overrides, oversize rejection, backpressure/rate behavior, pump fairness, reply transaction behavior, navigation invalidation, and closed-App behavior without treating the injector as an alternate implementation.
+- Narrow limitation remaining: this source pass updates the temporary injector and documents the intended probe assertions, but it does not run the disposable probe workflow or claim runtime verification.
+
+## 2026-06-25 — Severin bridge hardening source correction
+
+- Continued on the same branch and PR with a narrow source-correction pass over the bridge-hardening commit; no Servo build, runtime test, probe run, or external runner was attempted.
+- Added page-side shim staging bounds from the native effective envelope: exact UTF-8 byte measurement, immediate `BridgeTooLargeError` for oversize frames, immediate `BridgeBackpressureError` for local staging pressure, outbound byte accounting, and bounded drain byte release before Rust repeats authoritative checks.
+- Reworked rate refill to retain fractional token credit across rapid pump intervals so many short intervals accumulate like one longer interval.
+- Corrected document generation claiming so `load_path()` advances generation once, the first replacement-document drain claims its document ID without another generation bump, and shim-absent pumps do not repeatedly advance state.
+- Tightened `bridge_limits` conversion through CPython error checking, positive integer validation, overflow rejection, dependent-limit normalization for raised `max_frame_bytes`, and explicit rejection of contradictory byte ceilings.
+- Added deterministic owner-thread checks for public App methods without locks, background workers, callbacks, asyncio, or cross-thread repair behavior.
+- Changed receipt allocation to checked increment so exhausted receipt identity space becomes ordinary backpressure rather than saturating and reusing `u64::MAX`.
+- Updated navigation/close documentation to describe the implemented terminal invalidation invariant and reserve explicit navigated/closed Promise rejections for a future observable-old-realm case.
+
+## 2026-06-25 — Severin bridge ledger consistency source correction
+
+- Continued the same branch and PR with a small source-only correction; no Servo build, runtime test, probe run, or external runner was attempted.
+- Kept page-side physical staging checks intact, and added private shim rejection deltas for oversize and local backpressure rejections so Rust can fold them into the App-lifetime debug ledger during the next successful drain.
+- Reset `last_pump_delivery_count` at the start of every `pump_once()` so the debug state reflects the most recent pump turn instead of a stale prior successful drain.
+- Made shared App getters reject when the Python object is already marked closed, while leaving `close()` idempotent and able to free the native pointer after a window-driven close.
+
+## 2026-06-25 — Severin window-close terminal cleanup source correction
+
+- Continued the same branch and PR with a tiny source-only window-close cleanup; no Servo build, runtime test, probe run, or external runner was attempted.
+- Added a shared bridge close-cleanup helper that clears pending evaluations and bridge transport state while leaving the native App allocation available for normal idempotent `close()`/deallocation.
+- Applied that helper to both window-close paths (`run()` and `pump()`) and to explicit close/deallocation, aligning window-driven closure with the documented terminal bridge boundary.

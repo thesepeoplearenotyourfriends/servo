@@ -29,7 +29,7 @@ def main() -> None:
   if (typeof globalThis.__severinDrain !== "function") {
     return JSON.stringify({ documentId: null, frames: [] });
   }
-  return JSON.stringify(globalThis.__severinDrain());
+  return JSON.stringify(globalThis.__severinDrain(__SEVERIN_DRAIN_LIMIT__));
 })()
 "#;
 ''',
@@ -52,13 +52,14 @@ def main() -> None:
     ownDrain: Object.prototype.hasOwnProperty.call(target, "__severinDrain"),
     ownResolve: Object.prototype.hasOwnProperty.call(target, "__severinResolve"),
   }));
-  let transport = { documentId: null, frames: [], shimPresent: false, drainError: null };
+  let transport = { documentId: null, frames: [], rejectionDelta: null, shimPresent: false, drainError: null };
   if (typeof globalThis.__severinDrain === "function") {
     transport.shimPresent = true;
     try {
-      const drained = globalThis.__severinDrain();
+      const drained = globalThis.__severinDrain(__SEVERIN_DRAIN_LIMIT__);
       transport.documentId = typeof drained.documentId === "string" ? drained.documentId : null;
       transport.frames = Array.isArray(drained.frames) ? drained.frames : [];
+      transport.rejectionDelta = drained.rejectionDelta || null;
     } catch (x) { transport.drainError = err(x); }
   }
   const probe = {
@@ -106,7 +107,7 @@ def main() -> None:
       },
     },
   };
-  return JSON.stringify({ documentId: transport.documentId, frames: transport.frames, transport, probe });
+  return JSON.stringify({ documentId: transport.documentId, frames: transport.frames, rejectionDelta: transport.rejectionDelta, transport, probe });
 })()
 "#;
 ''',
@@ -204,7 +205,7 @@ unsafe extern "C" fn app_write(self_: *mut PyAppObject, args: *mut PyObject) -> 
 ''',
         "Python snapshot method",
     )
-    text = repl(text, "static mut APP_METHODS: [PyMethodDef; 7] = [\n", "static mut APP_METHODS: [PyMethodDef; 8] = [\n", "method count")
+    text = repl(text, "static mut APP_METHODS: [PyMethodDef; 8] = [\n", "static mut APP_METHODS: [PyMethodDef; 9] = [\n", "method count")
     text = repl(
         text,
         '''    PyMethodDef {

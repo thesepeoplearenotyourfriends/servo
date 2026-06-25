@@ -66,3 +66,9 @@ Raw URL laundering note: `components/url/lib.rs` now logs suspicious raw URL tex
 `components/script/dom/html/htmlscriptelement.rs::HTMLScriptElement::prepare` logs external script `src` resolution with the raw `src` attribute value as `author_text`, the document base URL used by `base_url.join(&src)`, and `destination: Script`.
 
 `components/script/script_module.rs` and `components/script/module_loading.rs` now use the same `[local-runtime url-resolution]` vocabulary for static URL-like module specifier resolution and host-loaded static/dynamic module imports. `host_load_imported_module` is the clearest dynamic-import correlation point because it still has the author specifier string, importer/module base, resolved module URL, and module type before the request reaches the module fetch path.
+
+## Severin Python bridge notes
+
+`ports/severin-python/src/lib.rs` owns the experimental Severin Python bridge. This bridge is not a network/resource loader, TinyGate, RPC layer, callback registry, content-policy mechanism, or special asset stream. It is a package-local document mailbox: JavaScript submits a JSON value, Rust admits or rejects the serialized frame according to finite physical limits, Python reads `(receipt, json_text)`, and Python writes one valid JSON reply for that opaque generation-scoped receipt.
+
+For loader-map purposes, the bridge should be treated as host-mediated external effect plumbing rather than a fetch destination. Rust preserves document lifetime, receipt identity, one-shot settlement, page-side and native queue bounds, rate/burst bounds, owner-thread checks, and pump fairness, but it must not inspect or classify payload contents. Base64 image data, editor state, HTML fragments, arrays, scalars, `null`, and app-defined error objects are identical transport frames apart from UTF-8 byte count.
