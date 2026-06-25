@@ -195,6 +195,13 @@ jobs:
 
           test -d "$CARGO_TARGET_DIR"
 
+          echo "Discarding restored warm-state archive pieces before compilation."
+          rm -rf "$PIECES_DIR"
+
+          echo "=== Filesystem headroom before probe build ==="
+          df -h "$RUNNER_TEMP" / || true
+          df -i "$RUNNER_TEMP" / || true
+
       # The target directory is only truly warm when its source inputs keep the
       # same timestamps. A fresh actions/checkout writes the whole worktree
       # anew, which makes Cargo regard every source input as newer than the
