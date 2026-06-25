@@ -16,7 +16,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
 
 use servo::{
     EventLoopWaker, JSValue, JavaScriptEvaluationError, LoadStatus, Preferences, RenderingContext,
@@ -126,12 +127,21 @@ unsafe extern "C" {
         kwlist: *mut *mut c_char,
         ...
     ) -> c_int;
+    fn PyErr_Clear();
+    fn PyErr_Occurred() -> *mut PyObject;
     fn PyErr_SetString(exception: *mut PyObject, string: *const c_char);
     fn Py_IncRef(object: *mut PyObject);
     fn Py_DecRef(object: *mut PyObject);
     fn PyLong_AsLong(object: *mut PyObject) -> c_long;
     fn PyLong_AsUnsignedLongLong(object: *mut PyObject) -> u64;
     fn PyLong_FromUnsignedLongLong(value: u64) -> *mut PyObject;
+    fn PyDict_New() -> *mut PyObject;
+    fn PyDict_SetItemString(dict: *mut PyObject, key: *const c_char, value: *mut PyObject) -> c_int;
+    fn PyMapping_Check(object: *mut PyObject) -> c_int;
+    fn PyMapping_Items(object: *mut PyObject) -> *mut PyObject;
+    fn PyList_Size(list: *mut PyObject) -> isize;
+    fn PyList_GetItem(list: *mut PyObject, index: isize) -> *mut PyObject;
+    fn PyTuple_GetItem(tuple: *mut PyObject, position: isize) -> *mut PyObject;
     fn PyTuple_New(size: isize) -> *mut PyObject;
     fn PyTuple_SetItem(tuple: *mut PyObject, position: isize, item: *mut PyObject) -> c_int;
     fn PyUnicode_FromStringAndSize(string: *const c_char, size: isize) -> *mut PyObject;
@@ -159,6 +169,7 @@ impl EventLoopWaker for WinitEventLoopWaker {
 }
 
 struct EmbeddedServoApp {
+    owner_thread: ThreadId,
     presentation: WinitPresentation,
     servo: Servo,
     webview: WebView,
@@ -295,12 +306,65 @@ impl ApplicationHandler<SeverinWakerEvent> for WinitPump<'_> {
     }
 }
 
+#[derive(Clone)]
+struct BridgeLimits {
+    max_frame_bytes: usize,
+    max_live_receipts: usize,
+    max_queued_frames: usize,
+    max_queued_bytes: usize,
+    messages_per_second: u64,
+    message_burst: u64,
+    bytes_per_second: u64,
+    byte_burst: u64,
+    max_deliveries_per_pump: usize,
+}
+
 #[derive(Default)]
+struct BridgeLimitOverrides {
+    max_frame_bytes: bool,
+    max_queued_bytes: bool,
+    byte_burst: bool,
+}
+
+impl Default for BridgeLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: 1024 * 1024,
+            max_live_receipts: 128,
+            max_queued_frames: 128,
+            max_queued_bytes: 8 * 1024 * 1024,
+            messages_per_second: 256,
+            message_burst: 128,
+            bytes_per_second: 8 * 1024 * 1024,
+            byte_burst: 2 * 1024 * 1024,
+            max_deliveries_per_pump: 32,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BridgeLedger {
+    last_pump_delivery_count: usize,
+    frames_rejected_too_large: u64,
+    frames_rejected_backpressure: u64,
+    frames_rejected_rate: u64,
+    stale_replies_rejected: u64,
+    peak_live_receipt_count: usize,
+    peak_queued_byte_count: usize,
+}
+
 struct BridgeTransport {
+    limits: BridgeLimits,
     next_receipt: u64,
+    document_generation: u64,
     inbound: VecDeque<BridgeFrame>,
     pending: HashMap<u64, PendingReplyTarget>,
     active_document_id: Option<String>,
+    queued_byte_count: usize,
+    message_tokens: f64,
+    byte_tokens: f64,
+    last_refill: Instant,
+    ledger: BridgeLedger,
 }
 
 struct BridgeFrame {
@@ -317,6 +381,7 @@ struct PendingReplyTarget {
 enum PendingEvaluationKind {
     DrainOutbound,
     DeliverReply,
+    RejectRequest,
 }
 
 impl PendingEvaluationKind {
@@ -324,6 +389,7 @@ impl PendingEvaluationKind {
         match self {
             Self::DrainOutbound => "drain",
             Self::DeliverReply => "reply",
+            Self::RejectRequest => "reject",
         }
     }
 }
@@ -367,15 +433,71 @@ fn trace_evaluation_callback(
 }
 
 impl BridgeTransport {
+    fn new(limits: BridgeLimits) -> Self {
+        Self {
+            message_tokens: limits.message_burst as f64,
+            byte_tokens: limits.byte_burst as f64,
+            last_refill: Instant::now(),
+            limits,
+            next_receipt: 0,
+            document_generation: 1,
+            inbound: VecDeque::new(),
+            pending: HashMap::new(),
+            active_document_id: None,
+            queued_byte_count: 0,
+            ledger: BridgeLedger::default(),
+        }
+    }
+
+    fn refill(&mut self) {
+        let elapsed = self.last_refill.elapsed();
+        self.last_refill = Instant::now();
+        let secs = elapsed.as_secs_f64();
+        self.message_tokens = (self.message_tokens
+            + secs * self.limits.messages_per_second as f64)
+            .min(self.limits.message_burst as f64);
+        self.byte_tokens = (self.byte_tokens + secs * self.limits.bytes_per_second as f64)
+            .min(self.limits.byte_burst as f64);
+    }
+
     fn enqueue_from_javascript(
         &mut self,
         document_id: String,
         call_id: u64,
         json: String,
-    ) -> Result<u64, String> {
-        validate_json_frame(&json)?;
+    ) -> Result<u64, &'static str> {
+        let bytes = json.len();
+        if bytes > self.limits.max_frame_bytes {
+            self.ledger.frames_rejected_too_large += 1;
+            return Err("BridgeTooLargeError");
+        }
+        validate_json_frame(&json).map_err(|_| "BridgeBackpressureError")?;
+        let Some(new_queued_byte_count) = self.queued_byte_count.checked_add(bytes) else {
+            self.ledger.frames_rejected_backpressure += 1;
+            return Err("BridgeBackpressureError");
+        };
+        if self.pending.len() >= self.limits.max_live_receipts
+            || self.inbound.len() >= self.limits.max_queued_frames
+            || new_queued_byte_count > self.limits.max_queued_bytes
+        {
+            self.ledger.frames_rejected_backpressure += 1;
+            return Err("BridgeBackpressureError");
+        }
+        self.refill();
+        if self.message_tokens < 1.0 || self.byte_tokens < bytes as f64 {
+            self.ledger.frames_rejected_rate += 1;
+            return Err("BridgeBackpressureError");
+        }
+        self.message_tokens -= 1.0;
+        self.byte_tokens -= bytes as f64;
         self.active_document_id = Some(document_id.clone());
-        self.next_receipt = self.next_receipt.saturating_add(1);
+        self.next_receipt = match self.next_receipt.checked_add(1) {
+            Some(receipt) => receipt,
+            None => {
+                self.ledger.frames_rejected_backpressure += 1;
+                return Err("BridgeBackpressureError");
+            },
+        };
         let receipt = self.next_receipt;
         self.pending.insert(
             receipt,
@@ -384,20 +506,30 @@ impl BridgeTransport {
                 call_id,
             },
         );
+        self.queued_byte_count = new_queued_byte_count;
         self.inbound.push_back(BridgeFrame { receipt, json });
+        self.ledger.peak_live_receipt_count = self.ledger.peak_live_receipt_count.max(self.pending.len());
+        self.ledger.peak_queued_byte_count = self.ledger.peak_queued_byte_count.max(self.queued_byte_count);
         Ok(receipt)
     }
 
     fn read_for_python(&mut self) -> Option<BridgeFrame> {
-        self.inbound.pop_front()
+        let frame = self.inbound.pop_front()?;
+        self.queued_byte_count = self.queued_byte_count.saturating_sub(frame.json.len());
+        Some(frame)
     }
 
     fn prepare_reply(&mut self, receipt: u64, json: &str) -> Result<String, String> {
+        if json.len() > self.limits.max_frame_bytes {
+            return Err("bridge reply exceeds max_frame_bytes".to_owned());
+        }
         validate_json_frame(json)?;
         let Some(target) = self.pending.get(&receipt) else {
+            self.ledger.stale_replies_rejected += 1;
             return Err("bridge reply target no longer exists".to_owned());
         };
         if self.active_document_id.as_deref() != Some(target.document_id.as_str()) {
+            self.ledger.stale_replies_rejected += 1;
             return Err("bridge reply target document is no longer active".to_owned());
         }
         let script = resolve_script(&target.document_id, target.call_id, json);
@@ -414,13 +546,31 @@ impl BridgeTransport {
     }
 
     fn clear_for_navigation(&mut self) {
+        self.document_generation = self.document_generation.checked_add(1).unwrap_or(u64::MAX);
         self.inbound.clear();
         self.pending.clear();
         self.active_document_id = None;
+        self.queued_byte_count = 0;
+        self.message_tokens = self.limits.message_burst as f64;
+        self.byte_tokens = self.limits.byte_burst as f64;
+        self.last_refill = Instant::now();
     }
 
     fn clear_for_close(&mut self) {
         self.clear_for_navigation();
+    }
+
+    fn observe_document(&mut self, document_id: &str) {
+        match self.active_document_id.as_deref() {
+            None => {
+                self.active_document_id = Some(document_id.to_owned());
+            },
+            Some(active) if active == document_id => {},
+            Some(_) => {
+                self.clear_for_navigation();
+                self.active_document_id = Some(document_id.to_owned());
+            },
+        }
     }
 }
 
@@ -431,13 +581,49 @@ fn validate_json_frame(json: &str) -> Result<(), String> {
 }
 const SEVERIN_BRIDGE_SHIM: &str = r#"
 (() => {
+  const MAX_FRAME_BYTES = __SEVERIN_MAX_FRAME_BYTES__;
+  const MAX_LIVE_RECEIPTS = __SEVERIN_MAX_LIVE_RECEIPTS__;
+  const MAX_QUEUED_FRAMES = __SEVERIN_MAX_QUEUED_FRAMES__;
+  const MAX_QUEUED_BYTES = __SEVERIN_MAX_QUEUED_BYTES__;
   const documentId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   let nextCallId = 1;
   const outbound = [];
   const pending = new Map();
+  let outboundByteCount = 0;
+  let rejectedTooLarge = 0;
+  let rejectedBackpressure = 0;
 
   function rejectNotJson() {
     return Promise.reject(new TypeError("severin.send(value) requires a strict JSON value"));
+  }
+
+  function rejectTransport(name) {
+    const error = new Error(name);
+    error.name = name;
+    return Promise.reject(error);
+  }
+
+  function utf8ByteLength(source) {
+    let bytes = 0;
+    for (let i = 0; i < source.length; i++) {
+      const code = source.charCodeAt(i);
+      if (code < 0x80) {
+        bytes += 1;
+      } else if (code < 0x800) {
+        bytes += 2;
+      } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < source.length) {
+        const next = source.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          bytes += 4;
+          i += 1;
+        } else {
+          bytes += 3;
+        }
+      } else {
+        bytes += 3;
+      }
+    }
+    return bytes;
   }
 
   function send(value) {
@@ -450,9 +636,23 @@ const SEVERIN_BRIDGE_SHIM: &str = r#"
     if (typeof json !== "string") {
       return rejectNotJson();
     }
+    const jsonBytes = utf8ByteLength(json);
+    if (jsonBytes > MAX_FRAME_BYTES) {
+      rejectedTooLarge += 1;
+      return rejectTransport("BridgeTooLargeError");
+    }
+    if (
+      pending.size >= MAX_LIVE_RECEIPTS ||
+      outbound.length >= MAX_QUEUED_FRAMES ||
+      outboundByteCount + jsonBytes > MAX_QUEUED_BYTES
+    ) {
+      rejectedBackpressure += 1;
+      return rejectTransport("BridgeBackpressureError");
+    }
 
     const callId = nextCallId++;
-    outbound.push({ callId, json });
+    outbound.push({ callId, json, jsonBytes });
+    outboundByteCount += jsonBytes;
     return new Promise((resolve, reject) => {
       pending.set(callId, { resolve, reject });
     });
@@ -466,8 +666,39 @@ const SEVERIN_BRIDGE_SHIM: &str = r#"
   });
 
   Object.defineProperty(globalThis, "__severinDrain", {
-    value() {
-      return { documentId, frames: outbound.splice(0, outbound.length) };
+    value(limit) {
+      const drained = outbound.splice(0, limit);
+      for (const frame of drained) {
+        outboundByteCount -= frame.jsonBytes;
+        delete frame.jsonBytes;
+      }
+      const rejectionDelta = {
+        tooLarge: rejectedTooLarge,
+        backpressure: rejectedBackpressure,
+      };
+      rejectedTooLarge = 0;
+      rejectedBackpressure = 0;
+      return { documentId, frames: drained, rejectionDelta };
+    },
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  });
+
+  Object.defineProperty(globalThis, "__severinReject", {
+    value(expectedDocumentId, callId, name) {
+      if (expectedDocumentId !== documentId) {
+        return false;
+      }
+      const target = pending.get(callId);
+      if (!target) {
+        return false;
+      }
+      const error = new Error(name);
+      error.name = name;
+      pending.delete(callId);
+      target.reject(error);
+      return true;
     },
     configurable: false,
     enumerable: false,
@@ -507,9 +738,34 @@ const DRAIN_SCRIPT: &str = r#"
   if (typeof globalThis.__severinDrain !== "function") {
     return JSON.stringify({ documentId: null, frames: [] });
   }
-  return JSON.stringify(globalThis.__severinDrain());
+  return JSON.stringify(globalThis.__severinDrain(__SEVERIN_DRAIN_LIMIT__));
 })()
 "#;
+
+fn drain_script(limit: usize) -> String {
+    DRAIN_SCRIPT.replace("__SEVERIN_DRAIN_LIMIT__", &limit.to_string())
+}
+
+fn bridge_shim(limits: &BridgeLimits) -> String {
+    SEVERIN_BRIDGE_SHIM
+        .replace("__SEVERIN_MAX_FRAME_BYTES__", &limits.max_frame_bytes.to_string())
+        .replace("__SEVERIN_MAX_LIVE_RECEIPTS__", &limits.max_live_receipts.to_string())
+        .replace("__SEVERIN_MAX_QUEUED_FRAMES__", &limits.max_queued_frames.to_string())
+        .replace("__SEVERIN_MAX_QUEUED_BYTES__", &limits.max_queued_bytes.to_string())
+}
+
+fn reject_script(document_id: &str, call_id: u64, name: &str) -> String {
+    let document_id_literal = serde_json::to_string(document_id).expect("document id serializes");
+    let name_literal = serde_json::to_string(name).expect("error name serializes");
+    format!(
+        r#"(() => {{
+  if (typeof globalThis.__severinReject !== "function") {{
+    return false;
+  }}
+  return globalThis.__severinReject({document_id_literal}, {call_id}, {name_literal});
+}})()"#
+    )
+}
 
 fn resolve_script(document_id: &str, call_id: u64, json: &str) -> String {
     let document_id_literal = serde_json::to_string(document_id).expect("document id serializes");
@@ -528,7 +784,7 @@ fn resolve_script(document_id: &str, call_id: u64, json: &str) -> String {
 }
 
 impl EmbeddedServoApp {
-    fn new(width: u32, height: u32) -> Result<Self, String> {
+    fn new(width: u32, height: u32, bridge_limits: BridgeLimits) -> Result<Self, String> {
         let trace_bridge = bridge_trace::enabled();
         bridge_trace::emit(
             trace_bridge,
@@ -572,7 +828,7 @@ impl EmbeddedServoApp {
             }))
             .build();
         let user_content_manager = Rc::new(UserContentManager::new(&servo));
-        user_content_manager.add_script(Rc::new(UserScript::from(SEVERIN_BRIDGE_SHIM)));
+        user_content_manager.add_script(Rc::new(UserScript::from(bridge_shim(&bridge_limits))));
         bridge_trace::emit(
             trace_bridge,
             format_args!("bridge-shim: queued in user-content manager"),
@@ -582,6 +838,7 @@ impl EmbeddedServoApp {
             .build();
         bridge_trace::emit(trace_bridge, format_args!("app:new webview constructed"));
         Ok(Self {
+            owner_thread: std::thread::current().id(),
             presentation: WinitPresentation {
                 event_loop,
                 window,
@@ -593,7 +850,7 @@ impl EmbeddedServoApp {
             _rendering_context: rendering_context,
             _user_content_manager: user_content_manager,
             wake_flag,
-            bridge_transport: BridgeTransport::default(),
+            bridge_transport: BridgeTransport::new(bridge_limits),
             pending_evaluations: Vec::new(),
             trace_bridge,
             next_evaluation_id: 0,
@@ -602,6 +859,10 @@ impl EmbeddedServoApp {
 
     fn trace(&self, message: std::fmt::Arguments<'_>) {
         bridge_trace::emit(self.trace_bridge, message);
+    }
+
+    fn is_owner_thread(&self) -> bool {
+        std::thread::current().id() == self.owner_thread
     }
 
     fn next_evaluation_id(&mut self) -> u64 {
@@ -631,6 +892,7 @@ impl EmbeddedServoApp {
     }
 
     fn pump_once(&mut self) -> Result<(), String> {
+        self.bridge_transport.ledger.last_pump_delivery_count = 0;
         self.spin_once();
         self.collect_bridge_evaluations()?;
         self.schedule_outbound_drain();
@@ -656,8 +918,9 @@ impl EmbeddedServoApp {
         let result = Rc::new(RefCell::new(None));
         let callback_result = result.clone();
         let trace_bridge = self.trace_bridge;
+        let script = drain_script(self.bridge_transport.limits.max_deliveries_per_pump);
         self.webview
-            .evaluate_javascript(DRAIN_SCRIPT, move |value| {
+            .evaluate_javascript(script, move |value| {
                 trace_evaluation_callback(trace_bridge, evaluation_id, kind, &value);
                 *callback_result.borrow_mut() = Some(value);
             });
@@ -669,8 +932,15 @@ impl EmbeddedServoApp {
     }
 
     fn schedule_reply_delivery(&mut self, script: String) {
+        self.schedule_evaluation(script, PendingEvaluationKind::DeliverReply);
+    }
+
+    fn schedule_request_rejection(&mut self, script: String) {
+        self.schedule_evaluation(script, PendingEvaluationKind::RejectRequest);
+    }
+
+    fn schedule_evaluation(&mut self, script: String, kind: PendingEvaluationKind) {
         let evaluation_id = self.next_evaluation_id();
-        let kind = PendingEvaluationKind::DeliverReply;
         self.trace(format_args!(
             "eval:{evaluation_id} queue kind={} script_bytes={}",
             kind.label(),
@@ -728,6 +998,17 @@ impl EmbeddedServoApp {
                     self.trace(format_args!("reply: delivery acknowledged"));
                     self.bridge_transport.finish_reply_delivery(delivered)?;
                 },
+                PendingEvaluationKind::RejectRequest => match result {
+                    Ok(JSValue::Boolean(_)) => {},
+                    Ok(value) => {
+                        return Err(format!(
+                            "Severin bridge request rejection returned unexpected value: {value:?}"
+                        ));
+                    },
+                    Err(error) => {
+                        return Err(format!("Severin bridge request rejection failed: {error:?}"));
+                    },
+                },
             }
         }
         Ok(())
@@ -742,6 +1023,17 @@ impl EmbeddedServoApp {
         ));
         self.pending_evaluations.clear();
         self.bridge_transport.clear_for_navigation();
+    }
+
+    fn clear_bridge_for_close(&mut self) {
+        self.trace(format_args!(
+            "bridge: clear close pending_evaluations={} inbound={} replies={}",
+            self.pending_evaluations.len(),
+            self.bridge_transport.inbound.len(),
+            self.bridge_transport.pending.len(),
+        ));
+        self.pending_evaluations.clear();
+        self.bridge_transport.clear_for_close();
     }
 
     fn handle_drain_result(
@@ -765,6 +1057,26 @@ impl EmbeddedServoApp {
         };
         let drained: serde_json::Value = serde_json::from_str(&serialized)
             .map_err(|error| format!("invalid Severin bridge drain result: {error}"))?;
+        if let Some(delta) = drained.get("rejectionDelta") {
+            let too_large = delta
+                .get("tooLarge")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| "invalid Severin bridge rejectionDelta.tooLarge".to_owned())?;
+            let backpressure = delta
+                .get("backpressure")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| "invalid Severin bridge rejectionDelta.backpressure".to_owned())?;
+            self.bridge_transport.ledger.frames_rejected_too_large = self
+                .bridge_transport
+                .ledger
+                .frames_rejected_too_large
+                .saturating_add(too_large);
+            self.bridge_transport.ledger.frames_rejected_backpressure = self
+                .bridge_transport
+                .ledger
+                .frames_rejected_backpressure
+                .saturating_add(backpressure);
+        }
         let document_id = drained
             .get("documentId")
             .and_then(|value| value.as_str())
@@ -772,14 +1084,14 @@ impl EmbeddedServoApp {
             .to_owned();
         if document_id.is_empty() {
             self.trace(format_args!("drain: shim absent in evaluated document"));
-            self.bridge_transport.clear_for_navigation();
             return Ok(());
         }
-        if self.bridge_transport.active_document_id.as_deref() != Some(document_id.as_str()) {
+        if self.bridge_transport.active_document_id.as_deref().is_some()
+            && self.bridge_transport.active_document_id.as_deref() != Some(document_id.as_str())
+        {
             self.trace(format_args!("drain: active document changed id={document_id}"));
-            self.bridge_transport.clear_for_navigation();
-            self.bridge_transport.active_document_id = Some(document_id.clone());
         }
+        self.bridge_transport.observe_document(&document_id);
         let Some(frames) = drained.get("frames").and_then(|value| value.as_array()) else {
             let message = "Severin bridge drain result did not contain a frames array".to_owned();
             self.trace(format_args!("drain: failed error={message}"));
@@ -798,11 +1110,22 @@ impl EmbeddedServoApp {
                 self.trace(format_args!("drain: skipped malformed frame call_id={call_id} missing json"));
                 continue;
             };
-            let receipt = self.bridge_transport.enqueue_from_javascript(
+            let receipt = match self.bridge_transport.enqueue_from_javascript(
                 document_id.clone(),
                 call_id,
                 json.to_owned(),
-            )?;
+            ) {
+                Ok(receipt) => receipt,
+                Err(error_name) => {
+                    self.trace(format_args!(
+                        "frame: reject call_id={call_id} error={error_name} json_bytes={}",
+                        json.len()
+                    ));
+                    self.schedule_request_rejection(reject_script(&document_id, call_id, error_name));
+                    continue;
+                },
+            };
+            self.bridge_transport.ledger.last_pump_delivery_count += 1;
             self.trace(format_args!(
                 "frame: enqueue receipt={receipt} call_id={call_id} json_bytes={}",
                 json.len()
@@ -828,15 +1151,17 @@ unsafe extern "C" fn app_init(
     let mut width_obj: *mut PyObject = ptr::null_mut();
     let mut height_obj: *mut PyObject = ptr::null_mut();
     let mut bridge: *mut PyObject = ptr::null_mut();
+    let mut bridge_limits_obj: *mut PyObject = ptr::null_mut();
     if unsafe {
         PyArg_ParseTupleAndKeywords(
             args,
             kwds,
-            c"OO|O".as_ptr(),
+            c"OO|O$O".as_ptr(),
             ptr::addr_of_mut!(APP_INIT_KWLIST).cast(),
             &mut width_obj,
             &mut height_obj,
             &mut bridge,
+            &mut bridge_limits_obj,
         )
     } == 0
     {
@@ -848,7 +1173,14 @@ unsafe extern "C" fn app_init(
         unsafe { set_error(PyExc_ValueError, "width and height must be positive") };
         return -1;
     }
-    match EmbeddedServoApp::new(width as u32, height as u32) {
+    let bridge_limits = match unsafe { parse_bridge_limits(bridge_limits_obj) } {
+        Ok(limits) => limits,
+        Err(error) => {
+            unsafe { set_error(PyExc_ValueError, &error) };
+            return -1;
+        },
+    };
+    match EmbeddedServoApp::new(width as u32, height as u32, bridge_limits) {
         Ok(app) => unsafe {
             (*self_).app = Box::into_raw(Box::new(app));
             (*self_).bridge = bridge;
@@ -868,7 +1200,7 @@ unsafe extern "C" fn app_dealloc(self_: *mut PyAppObject) {
     unsafe {
         if !(*self_).app.is_null() {
             (*(*self_).app).trace(format_args!("app: dealloc"));
-            (*(*self_).app).bridge_transport.clear_for_close();
+            (*(*self_).app).clear_bridge_for_close();
             drop(Box::from_raw((*self_).app));
             (*self_).app = ptr::null_mut();
         }
@@ -880,8 +1212,17 @@ unsafe extern "C" fn app_dealloc(self_: *mut PyAppObject) {
 }
 unsafe fn get_app<'a>(self_: *mut PyAppObject) -> Result<&'a EmbeddedServoApp, ()> {
     unsafe {
-        if (*self_).app.is_null() {
+        if (*self_).closed {
             set_error(PyExc_RuntimeError, "App is closed");
+            Err(())
+        } else if (*self_).app.is_null() {
+            set_error(PyExc_RuntimeError, "App is closed");
+            Err(())
+        } else if !(*(*self_).app).is_owner_thread() {
+            set_error(
+                PyExc_RuntimeError,
+                "App methods must be called from the creating Python thread",
+            );
             Err(())
         } else {
             Ok(&*(*self_).app)
@@ -890,8 +1231,17 @@ unsafe fn get_app<'a>(self_: *mut PyAppObject) -> Result<&'a EmbeddedServoApp, (
 }
 unsafe fn get_app_mut<'a>(self_: *mut PyAppObject) -> Result<&'a mut EmbeddedServoApp, ()> {
     unsafe {
-        if (*self_).app.is_null() {
+        if (*self_).closed {
             set_error(PyExc_RuntimeError, "App is closed");
+            Err(())
+        } else if (*self_).app.is_null() {
+            set_error(PyExc_RuntimeError, "App is closed");
+            Err(())
+        } else if !(*(*self_).app).is_owner_thread() {
+            set_error(
+                PyExc_RuntimeError,
+                "App methods must be called from the creating Python thread",
+            );
             Err(())
         } else {
             Ok(&mut *(*self_).app)
@@ -945,6 +1295,19 @@ unsafe extern "C" fn app_load_path(self_: *mut PyAppObject, arg: *mut PyObject) 
     }
 }
 unsafe extern "C" fn app_run(self_: *mut PyAppObject, _args: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        if (*self_).closed {
+            set_error(PyExc_RuntimeError, "App is closed");
+            return ptr::null_mut();
+        }
+        if !(*self_).app.is_null() && !(*(*self_).app).is_owner_thread() {
+            set_error(
+                PyExc_RuntimeError,
+                "App methods must be called from the creating Python thread",
+            );
+            return ptr::null_mut();
+        }
+    }
     let mut logged_begin = false;
     while unsafe { !(*self_).closed } {
         let Ok(app) = (unsafe { get_app_mut(self_) }) else {
@@ -957,6 +1320,7 @@ unsafe extern "C" fn app_run(self_: *mut PyAppObject, _args: *mut PyObject) -> *
         app.spin_once();
         if app.presentation.closed_by_window {
             app.trace(format_args!("load: aborted window closed"));
+            app.clear_bridge_for_close();
             unsafe {
                 (*self_).closed = true;
             }
@@ -984,6 +1348,7 @@ unsafe extern "C" fn app_pump(self_: *mut PyAppObject, _args: *mut PyObject) -> 
     }
     if app.presentation.closed_by_window {
         app.trace(format_args!("pump: window closed"));
+        app.clear_bridge_for_close();
         unsafe {
             (*self_).closed = true;
         }
@@ -996,10 +1361,17 @@ unsafe extern "C" fn app_pump(self_: *mut PyAppObject, _args: *mut PyObject) -> 
 
 unsafe extern "C" fn app_close(self_: *mut PyAppObject, _args: *mut PyObject) -> *mut PyObject {
     unsafe {
+        if !(*self_).app.is_null() && !(*(*self_).app).is_owner_thread() {
+            set_error(
+                PyExc_RuntimeError,
+                "App methods must be called from the creating Python thread",
+            );
+            return ptr::null_mut();
+        }
         (*self_).closed = true;
         if !(*self_).app.is_null() {
             (*(*self_).app).trace(format_args!("app: close"));
-            (*(*self_).app).bridge_transport.clear_for_close();
+            (*(*self_).app).clear_bridge_for_close();
             drop(Box::from_raw((*self_).app));
             (*self_).app = ptr::null_mut();
         }
@@ -1020,6 +1392,109 @@ unsafe fn unicode_to_string(object: *mut PyObject) -> Result<String, ()> {
             .to_string_lossy()
             .into_owned())
     }
+}
+
+unsafe fn py_positive_u64(name: &str, value: *mut PyObject) -> Result<u64, String> {
+    unsafe { PyErr_Clear() };
+    let raw = unsafe { PyLong_AsUnsignedLongLong(value) };
+    if !unsafe { PyErr_Occurred() }.is_null() {
+        unsafe { PyErr_Clear() };
+        return Err(format!("bridge_limits.{name} must be a positive finite integer"));
+    }
+    if raw == 0 {
+        return Err(format!("bridge_limits.{name} must be a positive finite integer"));
+    }
+    Ok(raw)
+}
+
+unsafe fn parse_bridge_limits(object: *mut PyObject) -> Result<BridgeLimits, String> {
+    let mut limits = BridgeLimits::default();
+    let defaults = BridgeLimits::default();
+    let mut overrides = BridgeLimitOverrides::default();
+    if object.is_null() || object == py_none() {
+        return Ok(limits);
+    }
+    if unsafe { PyMapping_Check(object) } == 0 {
+        return Err("bridge_limits must be a mapping or None".to_owned());
+    }
+    let items = unsafe { PyMapping_Items(object) };
+    if items.is_null() {
+        return Err("bridge_limits must expose mapping items".to_owned());
+    }
+    let item_count = unsafe { PyList_Size(items) };
+    if item_count < 0 {
+        unsafe { Py_DecRef(items) };
+        return Err("bridge_limits items could not be inspected".to_owned());
+    }
+    for index in 0..item_count {
+        let pair = unsafe { PyList_GetItem(items, index) };
+        if pair.is_null() {
+            unsafe { Py_DecRef(items) };
+            return Err("bridge_limits item could not be read".to_owned());
+        }
+        let key = unsafe { PyTuple_GetItem(pair, 0) };
+        let value = unsafe { PyTuple_GetItem(pair, 1) };
+        if key.is_null() || value.is_null() {
+            unsafe { Py_DecRef(items) };
+            return Err("bridge_limits items must be key/value pairs".to_owned());
+        }
+        let name = unsafe { unicode_to_string(key) }
+            .map_err(|_| "bridge_limits keys must be strings".to_owned())?;
+        let raw = match unsafe { py_positive_u64(&name, value) } {
+            Ok(raw) => raw,
+            Err(error) => {
+                unsafe { Py_DecRef(items) };
+                return Err(error);
+            },
+        };
+        let usize_value = match usize::try_from(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                unsafe { Py_DecRef(items) };
+                return Err(format!("bridge_limits.{name} is too large for this platform"));
+            },
+        };
+        match name.as_str() {
+            "max_frame_bytes" => {
+                limits.max_frame_bytes = usize_value;
+                overrides.max_frame_bytes = true;
+            },
+            "max_live_receipts" => limits.max_live_receipts = usize_value,
+            "max_queued_frames" => limits.max_queued_frames = usize_value,
+            "max_queued_bytes" => {
+                limits.max_queued_bytes = usize_value;
+                overrides.max_queued_bytes = true;
+            },
+            "messages_per_second" => limits.messages_per_second = raw,
+            "message_burst" => limits.message_burst = raw,
+            "bytes_per_second" => limits.bytes_per_second = raw,
+            "byte_burst" => {
+                limits.byte_burst = raw;
+                overrides.byte_burst = true;
+            },
+            "max_deliveries_per_pump" => limits.max_deliveries_per_pump = usize_value,
+            _ => {
+                unsafe { Py_DecRef(items) };
+                return Err(format!("unknown bridge_limits key: {name}"));
+            },
+        }
+    }
+    unsafe { Py_DecRef(items) };
+    if overrides.max_frame_bytes && limits.max_frame_bytes > defaults.max_frame_bytes {
+        if !overrides.byte_burst {
+            limits.byte_burst = limits.max_frame_bytes as u64;
+        }
+        if !overrides.max_queued_bytes {
+            limits.max_queued_bytes = limits.max_frame_bytes;
+        }
+    }
+    if limits.byte_burst < limits.max_frame_bytes as u64 {
+        return Err("bridge_limits.byte_burst must be at least max_frame_bytes".to_owned());
+    }
+    if limits.max_queued_bytes < limits.max_frame_bytes {
+        return Err("bridge_limits.max_queued_bytes must be at least max_frame_bytes".to_owned());
+    }
+    Ok(limits)
 }
 
 unsafe extern "C" fn app_read(self_: *mut PyAppObject, _args: *mut PyObject) -> *mut PyObject {
@@ -1068,6 +1543,88 @@ unsafe extern "C" fn app_read(self_: *mut PyAppObject, _args: *mut PyObject) -> 
     tuple
 }
 
+unsafe fn dict_set_u64(dict: *mut PyObject, key: &CStr, value: u64) -> Result<(), ()> {
+    let py_value = unsafe { PyLong_FromUnsignedLongLong(value) };
+    if py_value.is_null() {
+        return Err(());
+    }
+    let result = unsafe { PyDict_SetItemString(dict, key.as_ptr(), py_value) };
+    unsafe { Py_DecRef(py_value) };
+    if result < 0 { Err(()) } else { Ok(()) }
+}
+
+unsafe fn bridge_limits_dict(limits: &BridgeLimits) -> *mut PyObject {
+    let dict = unsafe { PyDict_New() };
+    if dict.is_null() {
+        return ptr::null_mut();
+    }
+    let items = [
+        (c"max_frame_bytes", limits.max_frame_bytes as u64),
+        (c"max_live_receipts", limits.max_live_receipts as u64),
+        (c"max_queued_frames", limits.max_queued_frames as u64),
+        (c"max_queued_bytes", limits.max_queued_bytes as u64),
+        (c"messages_per_second", limits.messages_per_second),
+        (c"message_burst", limits.message_burst),
+        (c"bytes_per_second", limits.bytes_per_second),
+        (c"byte_burst", limits.byte_burst),
+        (c"max_deliveries_per_pump", limits.max_deliveries_per_pump as u64),
+    ];
+    for (key, value) in items {
+        if unsafe { dict_set_u64(dict, key, value) }.is_err() {
+            unsafe { Py_DecRef(dict) };
+            return ptr::null_mut();
+        }
+    }
+    dict
+}
+
+unsafe extern "C" fn app_bridge_debug_state(
+    self_: *mut PyAppObject,
+    _args: *mut PyObject,
+) -> *mut PyObject {
+    let Ok(app) = (unsafe { get_app(self_) }) else {
+        return ptr::null_mut();
+    };
+    let transport = &app.bridge_transport;
+    let dict = unsafe { PyDict_New() };
+    if dict.is_null() {
+        return ptr::null_mut();
+    }
+    let limits = unsafe { bridge_limits_dict(&transport.limits) };
+    if limits.is_null() {
+        unsafe { Py_DecRef(dict) };
+        return ptr::null_mut();
+    }
+    if unsafe { PyDict_SetItemString(dict, c"effective_limits".as_ptr(), limits) } < 0 {
+        unsafe {
+            Py_DecRef(limits);
+            Py_DecRef(dict);
+        }
+        return ptr::null_mut();
+    }
+    unsafe { Py_DecRef(limits) };
+    let items = [
+        (c"document_generation", transport.document_generation),
+        (c"live_receipt_count", transport.pending.len() as u64),
+        (c"queued_frame_count", transport.inbound.len() as u64),
+        (c"queued_byte_count", transport.queued_byte_count as u64),
+        (c"last_pump_delivery_count", transport.ledger.last_pump_delivery_count as u64),
+        (c"frames_rejected_too_large", transport.ledger.frames_rejected_too_large),
+        (c"frames_rejected_backpressure", transport.ledger.frames_rejected_backpressure),
+        (c"frames_rejected_rate", transport.ledger.frames_rejected_rate),
+        (c"stale_replies_rejected", transport.ledger.stale_replies_rejected),
+        (c"peak_live_receipt_count", transport.ledger.peak_live_receipt_count as u64),
+        (c"peak_queued_byte_count", transport.ledger.peak_queued_byte_count as u64),
+    ];
+    for (key, value) in items {
+        if unsafe { dict_set_u64(dict, key, value) }.is_err() {
+            unsafe { Py_DecRef(dict) };
+            return ptr::null_mut();
+        }
+    }
+    dict
+}
+
 unsafe extern "C" fn app_write(self_: *mut PyAppObject, args: *mut PyObject) -> *mut PyObject {
     let Ok(app) = (unsafe { get_app_mut(self_) }) else {
         return ptr::null_mut();
@@ -1104,13 +1661,14 @@ unsafe extern "C" fn app_write(self_: *mut PyAppObject, args: *mut PyObject) -> 
 unsafe fn py_none() -> *mut PyObject {
     ptr::addr_of_mut!(_Py_NoneStruct)
 }
-static mut APP_INIT_KWLIST: [*mut c_char; 4] = [
+static mut APP_INIT_KWLIST: [*mut c_char; 5] = [
     c"width".as_ptr().cast_mut(),
     c"height".as_ptr().cast_mut(),
     c"bridge".as_ptr().cast_mut(),
+    c"bridge_limits".as_ptr().cast_mut(),
     ptr::null_mut(),
 ];
-static mut APP_METHODS: [PyMethodDef; 7] = [
+static mut APP_METHODS: [PyMethodDef; 8] = [
     PyMethodDef {
         ml_name: c"load_path".as_ptr(),
         ml_meth: app_load_path as *mut c_void,
@@ -1146,6 +1704,12 @@ static mut APP_METHODS: [PyMethodDef; 7] = [
         ml_meth: app_read as *mut c_void,
         ml_flags: METH_NOARGS,
         ml_doc: c"Read the next opaque JSON bridge frame and private receipt, if any.".as_ptr(),
+    },
+    PyMethodDef {
+        ml_name: c"bridge_debug_state".as_ptr(),
+        ml_meth: app_bridge_debug_state as *mut c_void,
+        ml_flags: METH_NOARGS,
+        ml_doc: c"Return read-only diagnostic bridge state.".as_ptr(),
     },
     PyMethodDef {
         ml_name: ptr::null(),
