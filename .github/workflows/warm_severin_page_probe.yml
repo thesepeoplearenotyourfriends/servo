@@ -155,13 +155,6 @@ jobs:
 
           test -d "$CARGO_TARGET_DIR"
 
-          echo "Discarding restored warm-state archive pieces before compilation."
-          rm -rf "$PIECES_DIR"
-
-          echo "=== Filesystem headroom before probe build ==="
-          df -h "$RUNNER_TEMP" / || true
-          df -i "$RUNNER_TEMP" / || true
-
       - name: Restore warmed repository worktree
         if: steps.warm_state.outputs.has_repo_worktree == 'true'
         run: |
@@ -246,6 +239,14 @@ jobs:
           fi
 
           test -d "$CARGO_TARGET_DIR"
+
+          echo "Discarding restored warm-state archive pieces before compilation."
+          rm -rf "$PIECES_DIR"
+
+          echo "=== Filesystem headroom before probe build ==="
+          df -h "$RUNNER_TEMP" / || true
+          df -i "$RUNNER_TEMP" / || true
+          
 
       - name: Reattach restored Rust toolchain
         run: |
