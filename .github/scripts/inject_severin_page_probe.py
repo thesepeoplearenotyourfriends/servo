@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Inject the disposable page/world survey used by the probe-wheel workflow."""
+"""Inject the disposable page/world survey used by the probe-wheel workflow.
+
+This injector targets the bounded, ledger-aware Severin bridge source.  It is
+intentionally strict about structural insertion points, but does not require
+snapshot collection to be immediately adjacent to JSON deserialization: the
+bridge now folds rejectionDelta into its native ledger between those points.
+"""
+
+from __future__ import annotations
+
+import re
 from pathlib import Path
 
 SOURCE = Path("ports/severin-python/src/lib.rs")
@@ -13,55 +23,68 @@ def repl(text: str, old: str, new: str, name: str) -> str:
     return text.replace(old, new, 1)
 
 
-def main() -> None:
-    text = SOURCE.read_text(encoding="utf-8")
-    text = repl(text, "mod bridge_trace;\n", "mod bridge_trace;\nmod bridge_probe;\n", "module")
-    text = repl(
-        text,
-        "    trace_bridge: bool,\n    next_evaluation_id: u64,\n",
-        "    trace_bridge: bool,\n    probe_bridge: bool,\n    probe_snapshot: Option<String>,\n    next_evaluation_id: u64,\n",
-        "app fields",
-    )
-    text = repl(
-        text,
-        '''const DRAIN_SCRIPT: &str = r#"
-(() => {
-  if (typeof globalThis.__severinDrain !== "function") {
-    return JSON.stringify({ documentId: null, frames: [] });
-  }
-  return JSON.stringify(globalThis.__severinDrain(__SEVERIN_DRAIN_LIMIT__));
-})()
-"#;
-''',
-        '''const DRAIN_SCRIPT: &str = r#"
+def repl_regex(text: str, pattern: str, new: str, name: str) -> str:
+    text, found = re.subn(pattern, new, text, count=1, flags=re.DOTALL)
+    if found != 1:
+        raise SystemExit(f"SEVERIN_PROBE: expected one {name} anchor, found {found}")
+    return text
+
+
+PROBE_DRAIN_SCRIPT = r'''const DRAIN_SCRIPT: &str = r#"
 (() => {
   const err = x => String(x && x.message ? x.message : x || "Error");
-  const safe = (name, fn) => { try { return fn(); } catch (x) { return { error: name + ":" + err(x) }; } };
+  const safe = (name, fn) => {
+    try {
+      return fn();
+    } catch (x) {
+      return { error: name + ":" + err(x) };
+    }
+  };
+
   const doc = typeof globalThis.document === "object" ? globalThis.document : null;
   const win = typeof globalThis.window === "object" ? globalThis.window : null;
   const root = doc && doc.documentElement ? doc.documentElement : null;
   const body = doc && doc.body ? doc.body : null;
   const attr = name => root ? root.getAttribute(name) : null;
-  const mark = target => !target || typeof target !== "object" ? { target: "absent" } : safe("bridge", () => ({
-    target: "present",
-    severin: typeof target.severin,
-    send: target.severin ? typeof target.severin.send : "-",
-    drain: typeof target.__severinDrain,
-    resolve: typeof target.__severinResolve,
-    ownSeverin: Object.prototype.hasOwnProperty.call(target, "severin"),
-    ownDrain: Object.prototype.hasOwnProperty.call(target, "__severinDrain"),
-    ownResolve: Object.prototype.hasOwnProperty.call(target, "__severinResolve"),
-  }));
-  let transport = { documentId: null, frames: [], rejectionDelta: null, shimPresent: false, drainError: null };
+  const mark = target => !target || typeof target !== "object"
+    ? { target: "absent" }
+    : safe("bridge", () => ({
+        target: "present",
+        severin: typeof target.severin,
+        send: target.severin ? typeof target.severin.send : "-",
+        drain: typeof target.__severinDrain,
+        resolve: typeof target.__severinResolve,
+        reject: typeof target.__severinReject,
+        ownSeverin: Object.prototype.hasOwnProperty.call(target, "severin"),
+        ownDrain: Object.prototype.hasOwnProperty.call(target, "__severinDrain"),
+        ownResolve: Object.prototype.hasOwnProperty.call(target, "__severinResolve"),
+        ownReject: Object.prototype.hasOwnProperty.call(target, "__severinReject"),
+      }));
+
+  let transport = {
+    documentId: null,
+    frames: [],
+    rejectionDelta: null,
+    shimPresent: false,
+    drainError: null,
+  };
+
   if (typeof globalThis.__severinDrain === "function") {
     transport.shimPresent = true;
     try {
       const drained = globalThis.__severinDrain(__SEVERIN_DRAIN_LIMIT__);
       transport.documentId = typeof drained.documentId === "string" ? drained.documentId : null;
       transport.frames = Array.isArray(drained.frames) ? drained.frames : [];
-      transport.rejectionDelta = drained.rejectionDelta || null;
-    } catch (x) { transport.drainError = err(x); }
+      transport.rejectionDelta = drained &&
+        drained.rejectionDelta &&
+        typeof drained.rejectionDelta === "object"
+        ? drained.rejectionDelta
+        : { tooLarge: 0, backpressure: 0 };
+    } catch (x) {
+      transport.drainError = err(x);
+    }
   }
+
   const probe = {
     schema: "severin-page-world-sweep-v1",
     dom: {
@@ -82,7 +105,12 @@ def main() -> None:
       bodyStatic: body ? body.getAttribute("data-severin-static") : null,
       bodyLive: body ? body.getAttribute("data-severin-page-body-live") : null,
       scriptCount: safe("scripts", () => doc ? doc.scripts.length : null),
-      scripts: safe("script-list", () => doc ? Array.from(doc.scripts, s => ({ id: s.id || "", src: s.getAttribute("src") || "", type: s.getAttribute("type") || "classic", inlineBytes: s.src ? 0 : s.textContent.length })) : []),
+      scripts: safe("script-list", () => doc ? Array.from(doc.scripts, s => ({
+        id: s.id || "",
+        src: s.getAttribute("src") || "",
+        type: s.getAttribute("type") || "classic",
+        inlineBytes: s.src ? 0 : s.textContent.length,
+      })) : []),
     },
     worlds: {
       identities: {
@@ -107,30 +135,83 @@ def main() -> None:
       },
     },
   };
-  return JSON.stringify({ documentId: transport.documentId, frames: transport.frames, rejectionDelta: transport.rejectionDelta, transport, probe });
+
+  const result = {
+    documentId: transport.documentId,
+    frames: transport.frames,
+    transport,
+    probe,
+  };
+  if (transport.rejectionDelta !== null) {
+    result.rejectionDelta = transport.rejectionDelta;
+  }
+  return JSON.stringify(result);
 })()
-"#;
-''',
+"#;'''
+
+
+SNAPSHOT_BEFORE_DOCUMENT_ID = r'''        if self.probe_bridge {
+            let value = serde_json::json!({
+                "transport": drained.get("transport").cloned().unwrap_or(serde_json::Value::Null),
+                "probe": drained.get("probe").cloned().unwrap_or(serde_json::Value::Null),
+            });
+            let snapshot = serde_json::to_string(&value)
+                .map_err(|error| format!("failed to serialize Severin probe snapshot: {error}"))?;
+            if self.probe_snapshot.as_deref() != Some(snapshot.as_str()) {
+                bridge_probe::emit(format_args!("world snapshot bytes={}", snapshot.len()));
+                self.probe_snapshot = Some(snapshot);
+            }
+        }
+        let document_id = drained'''
+
+
+PROBE_SNAPSHOT_METHOD = r'''unsafe extern "C" fn app_probe_snapshot(
+    self_: *mut PyAppObject,
+    _args: *mut PyObject,
+) -> *mut PyObject {
+    let Ok(app) = (unsafe { get_app(self_) }) else {
+        return ptr::null_mut();
+    };
+    let Some(snapshot) = app.probe_snapshot.as_deref() else {
+        unsafe {
+            Py_IncRef(py_none());
+            return py_none();
+        }
+    };
+    unsafe { PyUnicode_FromStringAndSize(snapshot.as_ptr().cast(), snapshot.len() as isize) }
+}
+
+unsafe extern "C" fn app_write(self_: *mut PyAppObject, args: *mut PyObject) -> *mut PyObject {
+'''
+
+
+def main() -> None:
+    text = SOURCE.read_text(encoding="utf-8")
+
+    text = repl(
+        text,
+        "mod bridge_trace;\n",
+        "mod bridge_trace;\nmod bridge_probe;\n",
+        "module",
+    )
+    text = repl(
+        text,
+        "    trace_bridge: bool,\n    next_evaluation_id: u64,\n",
+        "    trace_bridge: bool,\n    probe_bridge: bool,\n    probe_snapshot: Option<String>,\n    next_evaluation_id: u64,\n",
+        "app fields",
+    )
+    text = repl_regex(
+        text,
+        r'const DRAIN_SCRIPT: &str = r#"\n.*?\n"#;',
+        PROBE_DRAIN_SCRIPT,
         "drain script",
     )
     text = repl(
         text,
-        '''        bridge_trace::emit(
-            trace_bridge,
-            format_args!("app:new width={width} height={height}"),
-        );
-
-        let mut event_loop = EventLoop::with_user_event()
-''',
-        '''        bridge_trace::emit(
-            trace_bridge,
-            format_args!("app:new width={width} height={height}"),
-        );
-        let probe_bridge = bridge_probe::enabled();
-        bridge_probe::emit(format_args!("app:new page/world sweep enabled"));
-
-        let mut event_loop = EventLoop::with_user_event()
-''',
+        "        let mut event_loop = EventLoop::with_user_event()\n",
+        "        let probe_bridge = bridge_probe::enabled();\n"
+        "        bridge_probe::emit(format_args!(\"app:new page/world sweep enabled\"));\n"
+        "        let mut event_loop = EventLoop::with_user_event()\n",
         "probe init",
     )
     text = repl(
@@ -160,52 +241,22 @@ def main() -> None:
     )
     text = repl(
         text,
-        '''        let drained: serde_json::Value = serde_json::from_str(&serialized)
-            .map_err(|error| format!("invalid Severin bridge drain result: {error}"))?;
-        let document_id = drained
-''',
-        '''        let drained: serde_json::Value = serde_json::from_str(&serialized)
-            .map_err(|error| format!("invalid Severin bridge drain result: {error}"))?;
-        if self.probe_bridge {
-            let value = serde_json::json!({
-                "transport": drained.get("transport").cloned().unwrap_or(serde_json::Value::Null),
-                "probe": drained.get("probe").cloned().unwrap_or(serde_json::Value::Null),
-            });
-            let snapshot = serde_json::to_string(&value)
-                .map_err(|error| format!("failed to serialize Severin probe snapshot: {error}"))?;
-            if self.probe_snapshot.as_deref() != Some(snapshot.as_str()) {
-                bridge_probe::emit(format_args!("world snapshot bytes={}", snapshot.len()));
-                self.probe_snapshot = Some(snapshot);
-            }
-        }
-        let document_id = drained
-''',
+        "        let document_id = drained",
+        SNAPSHOT_BEFORE_DOCUMENT_ID,
         "snapshot collection",
     )
     text = repl(
         text,
         'unsafe extern "C" fn app_write(self_: *mut PyAppObject, args: *mut PyObject) -> *mut PyObject {\n',
-        '''unsafe extern "C" fn app_probe_snapshot(
-    self_: *mut PyAppObject,
-    _args: *mut PyObject,
-) -> *mut PyObject {
-    let Ok(app) = (unsafe { get_app(self_) }) else {
-        return ptr::null_mut();
-    };
-    let Some(snapshot) = app.probe_snapshot.as_deref() else {
-        unsafe {
-            Py_IncRef(py_none());
-            return py_none();
-        }
-    };
-    unsafe { PyUnicode_FromStringAndSize(snapshot.as_ptr().cast(), snapshot.len() as isize) }
-}
-
-unsafe extern "C" fn app_write(self_: *mut PyAppObject, args: *mut PyObject) -> *mut PyObject {
-''',
+        PROBE_SNAPSHOT_METHOD,
         "Python snapshot method",
     )
-    text = repl(text, "static mut APP_METHODS: [PyMethodDef; 8] = [\n", "static mut APP_METHODS: [PyMethodDef; 9] = [\n", "method count")
+    text = repl(
+        text,
+        "static mut APP_METHODS: [PyMethodDef; 8] = [\n",
+        "static mut APP_METHODS: [PyMethodDef; 9] = [\n",
+        "method count",
+    )
     text = repl(
         text,
         '''    PyMethodDef {
@@ -230,20 +281,22 @@ unsafe extern "C" fn app_write(self_: *mut PyAppObject, args: *mut PyObject) -> 
 ''',
         "method entry",
     )
+
     SOURCE.write_text(text, encoding="utf-8")
     PROBE.write_text(
-        '''//! `SEVERIN_PROBE=1` diagnostics for the temporary page/world survey.
-pub(crate) const ENV: &str = "SEVERIN_PROBE";
-pub(crate) fn enabled() -> bool {
-    match std::env::var(ENV) {
-        Ok(value) => !matches!(value.as_str(), "" | "0" | "false" | "FALSE" | "off" | "OFF"),
-        Err(_) => false,
-    }
-}
-pub(crate) fn emit(message: std::fmt::Arguments<'_>) {
-    if enabled() { eprintln!("SEVERIN_PROBE: {message}"); }
-}
-''',
+        '''//! `SEVERIN_PROBE=1` diagnostics for the temporary page/world survey.\n\n'''
+        '''pub(crate) const ENV: &str = "SEVERIN_PROBE";\n\n'''
+        '''pub(crate) fn enabled() -> bool {\n'''
+        '''    match std::env::var(ENV) {\n'''
+        '''        Ok(value) => !matches!(value.as_str(), "" | "0" | "false" | "FALSE" | "off" | "OFF"),\n'''
+        '''        Err(_) => false,\n'''
+        '''    }\n'''
+        '''}\n\n'''
+        '''pub(crate) fn emit(message: std::fmt::Arguments<'_>) {\n'''
+        '''    if enabled() {\n'''
+        '''        eprintln!("SEVERIN_PROBE: {message}");\n'''
+        '''    }\n'''
+        '''}\n''',
         encoding="utf-8",
     )
     print("SEVERIN_PROBE: native page/world sweep injection complete")
