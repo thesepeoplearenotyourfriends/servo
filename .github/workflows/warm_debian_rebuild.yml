@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       build_python_wheel:
-        description: Build and publish the experimental Severin CPython wheel to the rolling Release.
+        description: Build and publish the Severin Python launcher wheel to the rolling Release.
         type: boolean
         default: false
 
@@ -458,9 +458,9 @@ jobs:
             PROCESSED_ELF_COUNT=$((PROCESSED_ELF_COUNT + 1))
           done < <(sort -nr "$ELF_LIST")
 
-          SERVOSHELL_PATH="$(find "$RUNTIME_DIR" -type f -name servoshell -print -quit)"
+          SERVOSHELL_PATH="$(find "$RUNTIME_DIR" -type f -name severin -print -quit)"
           if [ -z "$SERVOSHELL_PATH" ]; then
-            echo "Packaged servoshell not found for GLIBC floor inspection." >&2
+            echo "Packaged severin not found for GLIBC floor inspection." >&2
             exit 1
           fi
           GLIBC_FLOOR="$($READELF --version-info "$SERVOSHELL_PATH" 2>/dev/null | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -Vu | tail -n 1)"
@@ -539,7 +539,7 @@ jobs:
             echo "AFTER_INVENTORY=$AFTER_INVENTORY"
           } >> "$GITHUB_ENV"          
 
-      - name: Assemble experimental Severin CPython wheel
+      - name: Assemble Severin Python launcher wheel
         id: python_wheel
         if: ${{ inputs.build_python_wheel }}
         run: |
@@ -569,7 +569,7 @@ jobs:
           printf 'wheel_name=%s\n' "$wheel_name" >> "$GITHUB_OUTPUT"
 
           {
-            echo "### Severin CPython wheel"
+            echo "### Severin Python launcher wheel"
             echo
             echo "- Release asset: \`$wheel_name\`"
             echo "- Built only because **Build Python wheel** was selected."
@@ -806,14 +806,14 @@ jobs:
 
           unzip -q "$runtime_zip" -d "$OUTPUT_DIR"
 
-          servoshell_path="$(find "$OUTPUT_DIR" -type f -name servoshell -print -quit)"
+          servoshell_path="$(find "$OUTPUT_DIR" -type f -name severin -print -quit)"
           if [ -z "$servoshell_path" ]; then
-            echo "ERROR: stripped runtime ZIP did not contain servoshell." >&2
+            echo "ERROR: stripped runtime ZIP did not contain severin." >&2
             exit 1
           fi
 
           # Actions artifacts do not reliably preserve executable mode on a raw
-          # directory. The tarball keeps servoshell executable after download.
+          # directory. The tarball keeps severin executable after download.
           tar -C "$OUTPUT_DIR" -czf "$RUNTIME_TARBALL" .
 
           runtime_tree_size="$(du -sh "$OUTPUT_DIR" | cut -f1)"
@@ -836,7 +836,7 @@ jobs:
             echo "- Extracted runtime tree: $runtime_tree_size"
             echo "- Runtime tarball: $(basename "$RUNTIME_TARBALL") ($runtime_tarball_size)"
             echo "- Runtime tarball SHA-256: $runtime_tarball_sha256"
-            echo "- Packaged servoshell: $servoshell_version"
+            echo "- Packaged severin: $servoshell_version"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload stripped Severin runtime tarball

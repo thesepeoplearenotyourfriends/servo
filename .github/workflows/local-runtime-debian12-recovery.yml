@@ -208,8 +208,8 @@ jobs:
             find /etc/apt -maxdepth 3 -type f \( -name '*.list' -o -name '*.sources' \) -print -exec sha256sum {} \; | sort
             echo 'installed Debian packages from dpkg-query:'
             dpkg-query -W -f='${binary:Package}\t${Version}\n' | sort
-            echo 'final packaged servoshell --version output: pending package extraction'
-            echo 'final servoshell ELF GLIBC / GLIBCXX / CXXABI floors: pending package extraction'
+            echo 'final packaged severin --version output: pending package extraction'
+            echo 'final severin ELF GLIBC / GLIBCXX / CXXABI floors: pending package extraction'
           } > "${receipt}"
           echo "Wrote ${receipt}"
 
@@ -269,15 +269,15 @@ jobs:
             "${OBJCOPY}" --add-gnu-debuglink="${symbol_file}" "${elf_file}" || true
           done < <(sort -nr "${ELF_LIST}")
 
-          SERVOSHELL_PATH="$(find "${RUNTIME_DIR}" -type f -name servoshell -print -quit)"
+          SERVOSHELL_PATH="$(find "${RUNTIME_DIR}" -type f -name severin -print -quit)"
           if [ -z "${SERVOSHELL_PATH}" ]; then
-            echo 'Packaged servoshell not found.' >&2
+            echo 'Packaged severin not found.' >&2
             exit 1
           fi
           SERVOSHELL_VERSION="$(${SERVOSHELL_PATH} --version)"
           echo "${SERVOSHELL_VERSION}"
           if grep -qi 'nogit' <<<"${SERVOSHELL_VERSION}"; then
-            echo 'Packaged servoshell reported nogit; refusing to upload artifact.' >&2
+            echo 'Packaged severin reported nogit; refusing to upload artifact.' >&2
             exit 1
           fi
 
@@ -290,9 +290,9 @@ jobs:
           CXXABI_FLOOR="$(version_floor CXXABI)"
           {
             echo
-            echo 'final packaged servoshell --version output:'
+            echo 'final packaged severin --version output:'
             echo "${SERVOSHELL_VERSION}"
-            echo 'final servoshell ELF GLIBC / GLIBCXX / CXXABI floors:'
+            echo 'final severin ELF GLIBC / GLIBCXX / CXXABI floors:'
             echo "GLIBC_${GLIBC_FLOOR:-not detected}"
             echo "GLIBCXX_${GLIBCXX_FLOOR:-not detected}"
             echo "CXXABI_${CXXABI_FLOOR:-not detected}"

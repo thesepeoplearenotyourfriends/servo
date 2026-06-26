@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             let mut res = winresource::WindowsResource::new();
             res.set_icon("../../resources/servo.ico");
-            res.set_manifest_file("platform/windows/servoshell.exe.manifest");
+            res.set_manifest_file("platform/windows/severin.exe.manifest");
             res.compile().unwrap();
         }
         #[cfg(not(windows))]

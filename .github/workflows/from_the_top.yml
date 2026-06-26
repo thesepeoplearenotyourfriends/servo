@@ -169,9 +169,9 @@ jobs:
             PROCESSED_ELF_COUNT=$((PROCESSED_ELF_COUNT + 1))
           done < <(sort -nr "$ELF_LIST")
 
-          SERVOSHELL_PATH="$(find "$RUNTIME_DIR" -type f -name servoshell -print -quit)"
+          SERVOSHELL_PATH="$(find "$RUNTIME_DIR" -type f -name severin -print -quit)"
           if [ -z "$SERVOSHELL_PATH" ]; then
-            echo "Packaged servoshell not found for GLIBC floor inspection." >&2
+            echo "Packaged severin not found for GLIBC floor inspection." >&2
             exit 1
           fi
           GLIBC_FLOOR="$($READELF --version-info "$SERVOSHELL_PATH" 2>/dev/null | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -Vu | tail -n 1)"
@@ -438,9 +438,9 @@ jobs:
             PROCESSED_ELF_COUNT=$((PROCESSED_ELF_COUNT + 1))
           done < <(sort -nr "$ELF_LIST")
 
-          SERVOSHELL_PATH="$(find "$RUNTIME_DIR" -type f -name servoshell -print -quit)"
+          SERVOSHELL_PATH="$(find "$RUNTIME_DIR" -type f -name severin -print -quit)"
           if [ -z "$SERVOSHELL_PATH" ]; then
-            echo "Packaged servoshell not found for GLIBC floor inspection." >&2
+            echo "Packaged severin not found for GLIBC floor inspection." >&2
             exit 1
           fi
           GLIBC_FLOOR="$($READELF --version-info "$SERVOSHELL_PATH" 2>/dev/null | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -Vu | tail -n 1)"
@@ -534,14 +534,14 @@ jobs:
           mkdir -p "${OUTPUT_DIR}"
           unzip -q "${runtime_zip}" -d "${OUTPUT_DIR}"
 
-          servoshell_path="$(find "${OUTPUT_DIR}" -type f -name servoshell -print -quit)"
+          servoshell_path="$(find "${OUTPUT_DIR}" -type f -name severin -print -quit)"
           if [ -z "${servoshell_path}" ]; then
-            echo 'ERROR: stripped runtime ZIP did not contain servoshell.' >&2
+            echo 'ERROR: stripped runtime ZIP did not contain severin.' >&2
             exit 1
           fi
 
           # Uploading a raw directory through Actions can discard executable mode
-          # bits. Pack the extracted runtime in tar.gz so servoshell remains
+          # bits. Pack the extracted runtime in tar.gz so severin remains
           # executable after the browser download is unpacked locally.
           tar -C "${OUTPUT_DIR}" -czf "${RUNTIME_TARBALL}" .
 
@@ -563,7 +563,7 @@ jobs:
             echo "- Output tarball: $(basename "${RUNTIME_TARBALL}") (${runtime_tarball_size})"
             echo "- Output tarball SHA-256: ${runtime_tarball_sha256}"
             echo "- Debug-symbol ZIPs deliberately not copied: ${symbol_count}"
-            echo "- Packaged servoshell --version: ${servoshell_version}"
+            echo "- Packaged severin --version: ${servoshell_version}"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload stripped Debian 12 runtime only

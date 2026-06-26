@@ -13,11 +13,13 @@ use winit::event_loop::{EventLoop, EventLoop as WinitEventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
 use super::app::App;
+use super::bridge::BridgeThreadEvent;
 
 #[derive(Debug)]
 pub enum AppEvent {
     /// Another process or thread has kicked the OS event loop with EventLoopWaker.
     Waker,
+    SeverinBridge(BridgeThreadEvent),
     Accessibility(egui_winit::accesskit_winit::Event),
 }
 
@@ -30,7 +32,7 @@ impl From<egui_winit::accesskit_winit::Event> for AppEvent {
 impl AppEvent {
     pub(crate) fn window_id(&self) -> Option<WindowId> {
         match self {
-            AppEvent::Waker => None,
+            AppEvent::Waker | AppEvent::SeverinBridge(_) => None,
             AppEvent::Accessibility(event) => Some(event.window_id),
         }
     }

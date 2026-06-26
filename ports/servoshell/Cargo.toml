@@ -16,7 +16,7 @@ path = "lib.rs"
 bench = false
 
 [[bin]]
-name = "servoshell"
+name = "severin"
 path = "main.rs"
 bench = false
 
@@ -37,7 +37,7 @@ winresource = { workspace = true }
 [package.metadata.winresource]
 FileDescription = "ServoShell"
 LegalCopyright = "© The Servo Project Developers"
-OriginalFilename = "servoshell.exe"
+OriginalFilename = "severin.exe"
 ProductName = "ServoShell"
 
 [features]

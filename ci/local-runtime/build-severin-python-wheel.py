@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Assemble the experimental Severin CPython extension wheel.
+"""Assemble the visible Severin Python launcher/controller wheel.
 
-This intentionally avoids a packaging framework: Cargo builds the native module,
-and this script stages the Cargo cdylib under the exact extension filename that
-this CPython interpreter imports, then writes the minimal wheel metadata needed
-for offline `pip install --no-deps`.
+The visible Python package is pure Python and imports as ``severin``. It launches
+and controls the single headed ``severin`` executable through inherited anonymous
+pipe FDs. The older in-process CPython extension is intentionally not packaged by
+this script, so it cannot shadow the visible launcher package.
 """
 
 from __future__ import annotations
@@ -16,9 +16,6 @@ import hashlib
 import os
 import re
 import shutil
-import subprocess
-import sys
-import sysconfig
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -39,24 +36,6 @@ def workspace_version(repo: Path) -> str:
     raise SystemExit("Could not find [workspace.package] version in Cargo.toml")
 
 
-def python_tags() -> tuple[str, str, str, str]:
-    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
-    if not ext_suffix:
-        raise SystemExit("CPython did not report EXT_SUFFIX")
-
-    soabi = sysconfig.get_config_var("SOABI") or ""
-    version = sys.version_info
-    python_tag = f"cp{version.major}{version.minor}"
-
-    if soabi.startswith(f"cpython-{version.major}{version.minor}"):
-        abi_tag = python_tag
-    else:
-        raise SystemExit(f"Unsupported or non-CPython SOABI for this wheel: {soabi!r}")
-
-    platform = sysconfig.get_platform().replace("-", "_").replace(".", "_")
-    return ext_suffix, python_tag, abi_tag, platform
-
-
 def wheel_hash(data: bytes) -> str:
     digest = hashlib.sha256(data).digest()
     return "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
@@ -64,8 +43,8 @@ def wheel_hash(data: bytes) -> str:
 
 def write_wheel_record(wheel_path: Path) -> None:
     rows: list[list[str]] = []
-    record_name = next(name for name in ZipFile(wheel_path).namelist() if name.endswith(".dist-info/RECORD"))
     with ZipFile(wheel_path, "r") as zf:
+        record_name = next(name for name in zf.namelist() if name.endswith(".dist-info/RECORD"))
         for name in zf.namelist():
             if name == record_name:
                 rows.append([name, "", ""])
@@ -80,7 +59,6 @@ def write_wheel_record(wheel_path: Path) -> None:
         buf = StringIO()
         csv.writer(buf, lineterminator="\n").writerow(row)
         rendered.append(buf.getvalue())
-    record_text = "".join(rendered)
 
     tmp_path = wheel_path.with_suffix(".tmp.whl")
     with ZipFile(wheel_path, "r") as zin, ZipFile(
@@ -90,76 +68,70 @@ def write_wheel_record(wheel_path: Path) -> None:
             if item.filename == record_name:
                 continue
             zout.writestr(item, zin.read(item.filename))
-        zout.writestr(record_name, record_text)
+        zout.writestr(record_name, "".join(rendered))
     tmp_path.replace(wheel_path)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default=os.environ.get("GITHUB_WORKSPACE", "."))
+    parser.add_argument("--output-dir", default="release")
+    # Kept so older workflow invocations do not accidentally re-enable extension packaging.
     parser.add_argument("--target-dir", default=os.environ.get("CARGO_TARGET_DIR", "target"))
     parser.add_argument("--profile", default="release")
-    parser.add_argument("--output-dir", default="release")
     parser.add_argument("--skip-cargo-build", action="store_true")
     args = parser.parse_args()
 
     repo = Path(args.repo).resolve()
-    target_dir = Path(args.target_dir).resolve()
     output_dir = (repo / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not args.skip_cargo_build:
-        subprocess.run(
-            ["cargo", "build", "-p", "severin-python", "--release"],
-            cwd=repo,
-            check=True,
-        )
-
     version = workspace_version(repo)
-    ext_suffix, python_tag, abi_tag, platform_tag = python_tags()
-    wheel_name = f"severin-{version}-{python_tag}-{abi_tag}-{platform_tag}.whl"
+    wheel_name = f"severin-{version}-py3-none-any.whl"
     dist_info = f"severin-{version}.dist-info"
     wheel_path = output_dir / wheel_name
 
-    cargo_lib = target_dir / args.profile / "libseverin.so"
-    if not cargo_lib.exists():
-        raise SystemExit(f"Cargo output not found: {cargo_lib}")
-
-    extension_name = f"severin{ext_suffix}"
-    staged_extension = output_dir / extension_name
-    shutil.copy2(cargo_lib, staged_extension)
+    package_source = repo / "ports" / "severin-python" / "severin"
+    if not (package_source / "__init__.py").exists():
+        raise SystemExit(f"Launcher package not found: {package_source}")
 
     metadata = (
         "Metadata-Version: 2.1\n"
         "Name: severin\n"
         f"Version: {version}\n"
-        "Summary: Experimental in-process CPython bindings for the Severin local Servo runtime.\n"
+        "Summary: Pure-Python launcher/controller for the headed Severin runtime.\n"
         "License: MPL-2.0\n"
         "Requires-Python: >=3.11\n"
     )
     wheel = (
         "Wheel-Version: 1.0\n"
         "Generator: ci/local-runtime/build-severin-python-wheel.py\n"
-        "Root-Is-Purelib: false\n"
-        f"Tag: {python_tag}-{abi_tag}-{platform_tag}\n"
+        "Root-Is-Purelib: true\n"
+        "Tag: py3-none-any\n"
     )
+
+    staging = output_dir / ".severin-wheel-root"
+    if staging.exists():
+        shutil.rmtree(staging)
+    shutil.copytree(package_source, staging / "severin")
 
     with ZipFile(
         wheel_path, "w", compression=ZIP_DEFLATED, compresslevel=9, strict_timestamps=False
     ) as zf:
-        zf.write(staged_extension, extension_name)
+        for path in sorted((staging / "severin").rglob("*")):
+            if path.is_file():
+                zf.write(path, path.relative_to(staging).as_posix())
         zf.writestr(f"{dist_info}/METADATA", metadata)
         zf.writestr(f"{dist_info}/WHEEL", wheel)
         zf.writestr(f"{dist_info}/RECORD", "")
-    staged_extension.unlink()
+    shutil.rmtree(staging)
     write_wheel_record(wheel_path)
 
     print(f"wheel={wheel_path}")
     print(f"wheel_name={wheel_name}")
-    print(f"python_tag={python_tag}")
-    print(f"abi_tag={abi_tag}")
-    print(f"platform_tag={platform_tag}")
-    print(f"extension_suffix={ext_suffix}")
+    print("python_tag=py3")
+    print("abi_tag=none")
+    print("platform_tag=any")
     return 0
 
 

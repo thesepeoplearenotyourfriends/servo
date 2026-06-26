@@ -320,6 +320,13 @@ impl RunningAppState {
             .webview_by_id(webview_id)
     }
 
+    pub(crate) fn active_or_newest_webview(&self) -> Option<WebView> {
+        self.windows
+            .borrow()
+            .values()
+            .find_map(|window| window.active_or_newest_webview())
+    }
+
     pub(crate) fn webdriver_receiver(&self) -> Option<&Receiver<WebDriverCommandMsg>> {
         self.webdriver_receiver.as_ref()
     }
@@ -391,8 +398,8 @@ impl RunningAppState {
                 return true;
             }
 
-            if let Some(focused_window) = self.focused_window() &&
-                Rc::ptr_eq(window, &focused_window)
+            if let Some(focused_window) = self.focused_window()
+                && Rc::ptr_eq(window, &focused_window)
             {
                 *self.focused_window.borrow_mut() = None;
             }
@@ -441,8 +448,8 @@ impl RunningAppState {
 
         // When no more windows are open, exit the application. Do not do this when
         // running WebDriver, which expects to keep running with no WebView open.
-        if self.servoshell_preferences.webdriver_port.get().is_none() &&
-            self.windows.borrow().is_empty()
+        if self.servoshell_preferences.webdriver_port.get().is_none()
+            && self.windows.borrow().is_empty()
         {
             self.schedule_exit()
         }

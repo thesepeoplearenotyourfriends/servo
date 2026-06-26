@@ -41,7 +41,7 @@ fn main() {
             // Android: see ports/servoshell/egl/android/mod.rs.
             // OpenHarmony: see ports/servoshell/egl/ohos/mod.rs.
             println!(
-                "Cannot run the servoshell `bin` executable on platforms such as \
+                "Cannot run the severin `bin` executable on platforms such as \
                  Android or OpenHarmony. On these platforms you need to compile \
                  the servoshell library as a `cdylib` and integrate it with the \
                  platform app code into an `apk` (android) or `hap` (OpenHarmony).\

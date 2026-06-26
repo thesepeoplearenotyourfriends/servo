@@ -26,6 +26,33 @@ use url::Url;
 
 use crate::VERSION;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BridgeFdConfig {
+    pub request_fd: i32,
+    pub reply_fd: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SeverinPackageConfig {
+    pub id: String,
+    pub root: PathBuf,
+    pub entry: String,
+}
+
+impl SeverinPackageConfig {
+    pub(crate) fn entry_url(&self) -> Result<Url, String> {
+        let entry = self.entry.trim_start_matches('/');
+        if entry.is_empty() || entry.split('/').any(|part| part == ".." || part.is_empty()) {
+            return Err(
+                "--severin-entry must be a relative package path without empty or '..' segments"
+                    .to_owned(),
+            );
+        }
+        Url::parse(&format!("asset://{}/{entry}", self.id))
+            .map_err(|error| format!("invalid Severin asset URL: {error}"))
+    }
+}
+
 /// Preferences enabled when servoshell is launched with the `--enable-experimental-web-platform-features` flag.
 ///
 /// These preferences are disabled by default but activated in experimental mode.
@@ -56,6 +83,8 @@ pub(crate) static EXPERIMENTAL_PREFS: &[&str] = &[
 pub(crate) struct ServoShellPreferences {
     /// A URL to load when starting servoshell.
     pub url: Option<String>,
+    pub severin_package: Option<SeverinPackageConfig>,
+    pub severin_bridge_fds: Option<BridgeFdConfig>,
     /// An override value for the device pixel ratio.
     pub device_pixel_ratio_override: Option<f32>,
     /// Whether or not to attempt clean shutdown.
@@ -123,6 +152,8 @@ impl Default for ServoShellPreferences {
             searchpage: "https://duckduckgo.com/html/?q=%s".into(),
             tracing_filter: None,
             url: None,
+            severin_package: None,
+            severin_bridge_fds: None,
             output_image_path: None,
             exit_after_stable_image: false,
             userscripts_directory: None,
@@ -375,7 +406,7 @@ fn map_debug_options(arg: String) -> Vec<String> {
 }
 
 #[derive(Bpaf, Clone, Debug)]
-#[bpaf(options, version(VERSION), usage("servoshell [OPTIONS] URL"))]
+#[bpaf(options, version(VERSION), usage("severin [OPTIONS] URL"))]
 // Newlines in comments are intentional to have the right formatting for the help message.
 struct CmdArgs {
     /// Background Hang Monitor enabled.
@@ -581,6 +612,26 @@ struct CmdArgs {
     #[bpaf(long)]
     zealous_gc: bool,
 
+    /// Child-side write FD for private Severin JS/document -> Python request frames.
+    #[bpaf(long("bridge-request-fd"), argument("FD"))]
+    bridge_request_fd: Option<i32>,
+
+    /// Child-side read FD for private Severin Python -> JS/document reply frames.
+    #[bpaf(long("bridge-reply-fd"), argument("FD"))]
+    bridge_reply_fd: Option<i32>,
+
+    /// Severin package id for asset:// package mode.
+    #[bpaf(long("severin-package-id"), argument("PACKAGE"))]
+    severin_package_id: Option<String>,
+
+    /// Absolute package root for Severin asset:// package mode.
+    #[bpaf(long("severin-package-root"), argument("PATH"))]
+    severin_package_root: Option<PathBuf>,
+
+    /// Entry path within the Severin package.
+    #[bpaf(long("severin-entry"), argument("PATH"))]
+    severin_entry: Option<String>,
+
     /// The url we should load.
     #[bpaf(positional("URL"), fallback(String::from("https://www.servo.org")))]
     url: String,
@@ -711,8 +762,75 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
             default_window_size.min(screen_size_override)
         });
 
+    let severin_bridge_fds = match (cmd_args.bridge_request_fd, cmd_args.bridge_reply_fd) {
+        (Some(request_fd), Some(reply_fd))
+            if request_fd >= 3 && reply_fd >= 3 && request_fd != reply_fd =>
+        {
+            Some(BridgeFdConfig {
+                request_fd,
+                reply_fd,
+            })
+        },
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            eprintln!(
+                "--bridge-request-fd and --bridge-reply-fd must be distinct FDs greater than or equal to 3"
+            );
+            return ArgumentParsingResult::ErrorParsing;
+        },
+        _ => {
+            eprintln!("--bridge-request-fd and --bridge-reply-fd must be supplied together");
+            return ArgumentParsingResult::ErrorParsing;
+        },
+    };
+
+    let severin_package = match (
+        cmd_args.severin_package_root.clone(),
+        cmd_args.severin_entry.clone(),
+    ) {
+        (Some(root), Some(entry)) => {
+            if !root.is_absolute() {
+                eprintln!("--severin-package-root must be absolute");
+                return ArgumentParsingResult::ErrorParsing;
+            }
+            let package = SeverinPackageConfig {
+                id: cmd_args
+                    .severin_package_id
+                    .clone()
+                    .unwrap_or_else(|| "com.example.app".to_owned()),
+                root,
+                entry,
+            };
+            if let Err(error) = package.entry_url() {
+                eprintln!("{error}");
+                return ArgumentParsingResult::ErrorParsing;
+            }
+            Some(package)
+        },
+        (None, None) => {
+            if cmd_args.severin_package_id.is_some() {
+                eprintln!(
+                    "--severin-package-id requires --severin-package-root and --severin-entry"
+                );
+                return ArgumentParsingResult::ErrorParsing;
+            }
+            None
+        },
+        _ => {
+            eprintln!("--severin-package-root and --severin-entry must be supplied together");
+            return ArgumentParsingResult::ErrorParsing;
+        },
+    };
+
+    let initial_url = severin_package
+        .as_ref()
+        .and_then(|package| package.entry_url().ok().map(|url| url.to_string()))
+        .unwrap_or(cmd_args.url);
+
     let servoshell_preferences = ServoShellPreferences {
-        url: Some(cmd_args.url),
+        url: Some(initial_url),
+        severin_package,
+        severin_bridge_fds,
         no_native_titlebar: cmd_args.no_native_titlebar,
         no_egui: cmd_args.no_egui,
         device_pixel_ratio_override: cmd_args.device_pixel_ratio,
@@ -780,7 +898,7 @@ fn parse_diagnostics_logging(cli_options: Vec<String>) -> Result<DiagnosticsLogg
 
     if cli_options.contains(&"help".into()) {
         // TODO: Remove hardcoded binary name by perhaps receiving this as an argument.
-        println!("Usage: servoshell -Z option,[option,...]\n\twhere options include:");
+        println!("Usage: severin -Z option,[option,...]\n\twhere options include:");
         print_option("help", "Show this help message");
         for option in DiagnosticsLoggingOption::iter() {
             print_option(option.help_option(), option.help_message())
