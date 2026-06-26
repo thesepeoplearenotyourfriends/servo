@@ -457,6 +457,7 @@ impl SeverinBridge {
         let Some(frames) = drained.get("frames").and_then(|value| value.as_array()) else {
             return Err("Severin bridge drain result did not contain a frames array".to_owned());
         };
+        let webview_id = webview.id();
         for frame in frames {
             let Some(call_id) = frame.get("callId").and_then(|value| value.as_u64()) else {
                 continue;
@@ -465,6 +466,7 @@ impl SeverinBridge {
                 continue;
             };
             let outbound = match self.transport.enqueue_from_javascript(
+                webview_id,
                 document_id.clone(),
                 call_id,
                 json.to_owned(),
