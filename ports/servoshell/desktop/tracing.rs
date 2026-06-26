@@ -53,6 +53,7 @@ mod from_winit {
                 Self::DeviceEvent { .. } => target!("DeviceEvent"),
                 Self::UserEvent(AppEvent::Waker) => target!("UserEvent(Waker)"),
                 Self::UserEvent(AppEvent::Accessibility(..)) => target!("UserEvent(Accessibility)"),
+                Self::UserEvent(AppEvent::SeverinBridge(..)) => target!("UserEvent(SeverinBridge)"),
                 Self::Suspended => target!("Suspended"),
                 Self::Resumed => target!("Resumed"),
                 Self::AboutToWait => target!("AboutToWait"),
