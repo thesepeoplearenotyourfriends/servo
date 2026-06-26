@@ -972,3 +972,25 @@ Everything else gets no phone line.
 - Continued the same branch and PR with a tiny source-only window-close cleanup; no Servo build, runtime test, probe run, or external runner was attempted.
 - Added a shared bridge close-cleanup helper that clears pending evaluations and bridge transport state while leaving the native App allocation available for normal idempotent `close()`/deallocation.
 - Applied that helper to both window-close paths (`run()` and `pump()`) and to explicit close/deallocation, aligning window-driven closure with the documented terminal bridge boundary.
+
+## 2026-06-26 — Visible runtime pivot implementation pass
+
+Inspected and changed the headed `ports/servoshell` desktop path so the single visible executable can run standalone with explicit Severin package arguments or Python-managed with optional inherited anonymous pipe FDs. Added a shell-local bridge module for the existing mailbox model, incremental private pipe framing, child reader/writer workers, event-loop proxy delivery, and WebView-side shim installation. Added a pure-Python launcher/controller under `ports/severin-python/severin/` for the new process architecture while leaving the experimental in-process extension intact.
+
+Touched crates/modules:
+
+* `ports/servoshell/desktop/event_loop.rs`
+* `ports/servoshell/desktop/app.rs`
+* `ports/servoshell/desktop/bridge.rs`
+* `ports/servoshell/prefs.rs`
+* `ports/servoshell/running_app_state.rs`
+* `ports/severin-python/severin/__init__.py`
+
+The bridge remains a receipt mailbox, not a fetch path, listener, network service, or application protocol. The first durable manual fixture is `ports/severin-python/fixtures/fd-bridge-demo/`.
+
+## 2026-06-26 — Inherited-FD preflight corrections
+
+- Resolved Python import identity by keeping the visible pure-Python launcher at `import severin` and moving the old native extension identity to `severin_embedded`.
+- Tightened child bridge FD validation to reject stdio FDs and marked adopted bridge FDs close-on-exec in the child before worker adoption.
+- Bound pending bridge receipts to the originating `WebViewId` in addition to document id and call id, so replies are not routed through active/newest WebView fallback.
+- Updated visible executable/artifact consumers found in desktop packaging paths from `servoshell` executable names to `severin` where they refer to the headed desktop artifact.

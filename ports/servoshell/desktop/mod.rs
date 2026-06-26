@@ -6,6 +6,7 @@
 
 mod accelerated_gl_media;
 pub(crate) mod app;
+pub(crate) mod bridge;
 pub(crate) mod cli;
 pub(crate) mod dialog;
 pub(crate) mod event_loop;

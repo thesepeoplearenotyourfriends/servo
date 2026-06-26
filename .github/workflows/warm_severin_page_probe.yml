@@ -296,11 +296,11 @@ jobs:
           set -Eeuo pipefail
 
           TAG="severin-page-probe"
-          WHEEL_NAME="severin-0.3.0+pageprobe-cp311-cp311-linux_x86_64.whl"
+          WHEEL_NAME="severin_embedded-0.3.0+pageprobe-cp311-cp311-linux_x86_64.whl"
           WHEEL_DIR="${RUNNER_TEMP}/severin-page-probe-wheel"
           WHEEL_ROOT="$WHEEL_DIR/root"
           WHEEL_PATH="$WHEEL_DIR/$WHEEL_NAME"
-          DIST_INFO="severin-0.3.0+pageprobe.dist-info"
+          DIST_INFO="severin_embedded-0.3.0+pageprobe.dist-info"
 
           rm -rf "$WHEEL_DIR"
           mkdir -p "$WHEEL_ROOT/$DIST_INFO"
@@ -318,11 +318,11 @@ jobs:
           fi
 
           cp "${extension_candidates[0]}" \
-            "$WHEEL_ROOT/severin.cpython-311-x86_64-linux-gnu.so"
+            "$WHEEL_ROOT/severin_embedded.cpython-311-x86_64-linux-gnu.so"
 
           cat > "$WHEEL_ROOT/$DIST_INFO/METADATA" <<'EOF'
           Metadata-Version: 2.1
-          Name: severin
+          Name: severin-embedded
           Version: 0.3.0+pageprobe
           Summary: Experimental CPython bindings for the Severin local Servo runtime, with page-global probe wiring.
           EOF

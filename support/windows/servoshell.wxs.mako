@@ -28,9 +28,9 @@
                        Guid="95bcea71-78bb-4ec8-9766-44bc01443840"
                        Win64="yes">
               <File Id="ServoEXE"
-                    Name="servoshell.exe"
+                    Name="severin.exe"
                     DiskId="1"
-                    Source="${windowize(exe_path)}\servoshell.exe"
+                    Source="${windowize(exe_path)}\severin.exe"
                     KeyPath="yes">
               </File>
 	            ${include_dependencies()}
@@ -53,9 +53,9 @@
             <Shortcut Id="StartMenuServoTechDemo"
               Directory="ProgramMenuDir"
               Name="Servo Tech Demo"
-              Target="[INSTALLDIR]servoshell.exe"
+              Target="[INSTALLDIR]severin.exe"
               WorkingDirectory="INSTALLDIR"
-              Icon="servoshell.exe"/>
+              Icon="severin.exe"/>
           </Component>
         </Directory>
       </Directory>
@@ -69,7 +69,7 @@
       <ComponentRef Id="ProgramMenuDir"/>
     </Feature>
 
-    <Icon Id="servoshell.exe" SourceFile="${windowize(exe_path)}\servoshell.exe"/>
+    <Icon Id="severin.exe" SourceFile="${windowize(exe_path)}\severin.exe"/>
   </Product>
 </Wix>
 <%!
@@ -92,7 +92,7 @@ def listdirs(directory):
             if path.isdir(path.join(directory, f))]
 
 def listdeps(temp_dir):
-    return [path.join(temp_dir, f) for f in os.listdir(temp_dir) if os.path.isfile(path.join(temp_dir, f)) and f != "servoshell.exe"]
+    return [path.join(temp_dir, f) for f in os.listdir(temp_dir) if os.path.isfile(path.join(temp_dir, f)) and f != "severin.exe"]
 
 def windowize(p):
     if not p.startswith("/"):

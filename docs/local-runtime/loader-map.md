@@ -72,3 +72,7 @@ Raw URL laundering note: `components/url/lib.rs` now logs suspicious raw URL tex
 `ports/severin-python/src/lib.rs` owns the experimental Severin Python bridge. This bridge is not a network/resource loader, TinyGate, RPC layer, callback registry, content-policy mechanism, or special asset stream. It is a package-local document mailbox: JavaScript submits a JSON value, Rust admits or rejects the serialized frame according to finite physical limits, Python reads `(receipt, json_text)`, and Python writes one valid JSON reply for that opaque generation-scoped receipt.
 
 For loader-map purposes, the bridge should be treated as host-mediated external effect plumbing rather than a fetch destination. Rust preserves document lifetime, receipt identity, one-shot settlement, page-side and native queue bounds, rate/burst bounds, owner-thread checks, and pump fairness, but it must not inspect or classify payload contents. Base64 image data, editor state, HTML fragments, arrays, scalars, `null`, and app-defined error objects are identical transport frames apart from UTF-8 byte count.
+
+## Visible runtime bridge note
+
+The visible runtime bridge is not a loader-map resource destination. The headed Severin executable uses the normal servoshell event loop and package-mode `asset://` loading for documents and subresources, while the optional Python bridge is a private inherited-FD mailbox for host-mediated external effects. It must not become a fallback resource loader or hidden network path.

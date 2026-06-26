@@ -1741,7 +1741,7 @@ static mut APP_SLOTS: [PyType_Slot; 5] = [
     },
 ];
 static mut APP_SPEC: PyType_Spec = PyType_Spec {
-    name: c"severin.App".as_ptr(),
+    name: c"severin_embedded.App".as_ptr(),
     basicsize: std::mem::size_of::<PyAppObject>() as c_int,
     itemsize: 0,
     flags: PY_TPFLAGS_DEFAULT | PY_TPFLAGS_BASETYPE,
@@ -1764,7 +1764,7 @@ static mut MODULE_DEF: PyModuleDef = PyModuleDef {
         index: 0,
         copy: ptr::null_mut(),
     },
-    name: c"severin".as_ptr(),
+    name: c"severin_embedded".as_ptr(),
     doc: c"Experimental in-process Servo Python embedding.".as_ptr(),
     size: 0,
     methods: ptr::null_mut(),
@@ -1787,6 +1787,6 @@ unsafe extern "C" fn module_exec(module: *mut PyObject) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyInit_severin() -> *mut PyObject {
+pub unsafe extern "C" fn PyInit_severin_embedded() -> *mut PyObject {
     unsafe { PyModuleDef_Init(ptr::addr_of_mut!(MODULE_DEF)) }
 }

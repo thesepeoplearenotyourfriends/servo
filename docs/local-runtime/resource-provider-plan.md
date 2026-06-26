@@ -136,11 +136,11 @@ Future `ResourceRequest` work should carry both the raw author spelling, when av
 
 ## Python Embedding Boundary
 
-A first CPython native extension crate now lives at `ports/severin-python/` and exposes a `severin` module with `App(width, height, bridge=None)`, `load_path(path)`, `run()`, `close()`, `write()`, and `read()`. This is an in-process embedding surface: the Python `App` owns Servo/WebView host state directly and must not use a helper executable, localhost server, HTTP, WebSocket, Unix socket, or other network-shaped bridge.
+An earlier CPython native extension crate lives at `ports/severin-python/` as experimental/manual in-process embedding work. Its import identity is now distinct from the visible launcher (`severin_embedded` rather than `severin`) so it cannot shadow the normal pure-Python launcher/controller package.
 
 The current `load_path` implementation is intentionally narrow and maps one entry file onto the existing first-milestone `asset://com.example.app/...` package wall. The final provider should replace that process-global handoff with an explicit package/context object before supporting multiple simultaneous Python `App` instances.
 
-The CPython embedding now has a standalone wheel assembly script for the direct GitHub Release distribution path. Build-pipeline integration is intentionally left outside this change while the Debian 12 workflows are repaired separately. This distribution path does not change the resource-provider model: the wheel contains the in-process extension and does not introduce a helper executable, port, socket, daemon, localhost service, or network bridge.
+The normal Python wheel path now packages the pure-Python `severin` launcher/controller. It does not contain the in-process native extension, does not embed Servo in Python, and does not introduce a helper listener, port, socket, daemon, localhost service, or network bridge.
 
 The Python bridge is a transport queue, not an application protocol. Page JavaScript submits arbitrary serialized JSON through `globalThis.severin.send(value)` and receives a Promise that resolves with the parsed JSON reply. Python reads `(opaque_receipt, json_text)` from the inbound queue and writes arbitrary valid JSON back against that private receipt. Receipts are native-only, single-use, and bound to the originating top-level document identity so navigation or teardown prevents delivery into a later document. The native layer must not define action names, capability names, permission rules, success/error conventions, request schemas, reply schemas, or a registry of host functions. Its only owned failures are transport/lifetime failures such as `App.close()`, document teardown, or an expired reply target. See `docs/local-runtime/python-embedding.md` for the current API and bridge transport model.
 
@@ -159,3 +159,27 @@ Receipts are opaque, one-shot, App-lifetime nonce tokens scoped to the active do
 Navigation and close are terminal bridge boundaries. `load_path()` terminally invalidates the old generation, discards unread old frames, makes old receipts unusable, prevents old reply targets from reaching the replacement document, advances generation once, and leaves the replacement document identity unknown until its first successful drain claims it. `close()` is idempotent, and explicit close or native window close clear pending evaluations, unread frames, and live receipts before later App operations fail through the documented closed-App behavior. Explicit `BridgeNavigatedError` and `BridgeClosedError` rejection names are reserved for a future case where an old realm is still live enough to observe native cancellation. App use is single-owner and explicit-pump: public App methods reject calls from non-owner Python threads, `read()` is nonblocking, and each `pump()` delivery pass is bounded by `max_deliveries_per_pump`.
 
 `app.bridge_debug_state()` is a compact diagnostic/probe surface only. It returns a Python mapping with the current document generation, effective limits, current live receipt count, current queued frame/byte counts, the delivery count for the most recent pump turn, App-lifetime rejection counters including private shim admission rejections folded at drain time, stale reply rejection count, and App-lifetime peaks for live receipts and queued bytes. It is not page-visible telemetry and does not define an application protocol.
+
+## Visible Severin runtime pivot: headed child + private inherited FDs
+
+The visible desktop runtime is now the single normal headed Severin executable, built from the existing `ports/servoshell` headed winit/Servo lifecycle. It supports two modes:
+
+```text
+severin --severin-package-root /abs/app --severin-entry index.html
+severin --severin-package-root /abs/app --severin-entry index.html \
+  --bridge-request-fd=<child-write-fd> --bridge-reply-fd=<child-read-fd>
+```
+
+The bridge FDs are optional inherited anonymous pipe handles. They are not a listener, address, port, WebSocket, HTTP endpoint, TCP/UDP socket, named Unix socket, or public IPC service. Both bridge FD options must be supplied together or omitted together.
+
+Python is now a launcher/controller for this same executable. It creates two one-way anonymous pipes, passes only the child ends with `pass_fds` and `close_fds=True`, reads child request frames, invokes the application callback with `(receipt, json_text)`, and writes replies through a single serialized writer thread. Python does not own Servo, winit, X11, input, timers, canvas, redraw, paint, or present.
+
+The private frame format in both directions is:
+
+```text
+[u32 big-endian JSON byte length][u64 big-endian receipt][UTF-8 JSON bytes]
+```
+
+The receipt remains transport-private and outside application JSON. Rust keeps only transport/lifetime limits: frame size, live receipts, queue/byte limits, rate limits, stale receipts, navigation/close invalidation, and bounded delivery work. It does not define action names, capability names, schemas, success/error envelopes, or host-function registries.
+
+`ports/severin-python` remains experimental/manual/headless/in-process embedding work under a distinct native-extension import identity. It is no longer the visible desktop rendering foundation and should not grow a replacement headed GUI lifecycle.

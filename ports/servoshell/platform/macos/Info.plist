@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleExecutable</key>
-	<string>servoshell</string>
+	<string>severin</string>
 	<key>CFBundleGetInfoString</key>
-	<string>ServoShell</string>
+	<string>Severin</string>
 	<key>CFBundleIconFile</key>
 	<string>servo.icns</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>ServoShell</string>
+	<string>Severin</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

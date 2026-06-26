@@ -19,6 +19,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::WindowId;
 
+use super::bridge::{BridgeEventOutcome, SeverinBridge};
 use super::event_loop::AppEvent;
 use crate::desktop::event_loop::ServoShellEventLoop;
 use crate::desktop::headed_window::HeadedWindow;
@@ -48,6 +49,7 @@ pub struct App {
     t_start: Instant,
     t: Instant,
     state: AppState,
+    bridge: Option<SeverinBridge>,
 }
 
 impl App {
@@ -65,6 +67,13 @@ impl App {
         );
 
         let t = Instant::now();
+        let bridge = servo_shell_preferences
+            .severin_bridge_fds
+            .and_then(|config| {
+                event_loop
+                    .event_loop_proxy()
+                    .map(|proxy| SeverinBridge::new(config, proxy))
+            });
         App {
             opts,
             preferences,
@@ -75,11 +84,19 @@ impl App {
             t_start: t,
             t,
             state: AppState::Initializing,
+            bridge,
         }
     }
 
     /// Initialize Application once event loop start running.
     pub fn init(&mut self, active_event_loop: Option<&ActiveEventLoop>) {
+        if let Some(package) = &self.servoshell_preferences.severin_package {
+            unsafe {
+                std::env::set_var("SERVORENA_PACKAGE_ID", &package.id);
+                std::env::set_var("SERVORENA_PACKAGE_ROOT", &package.root);
+            }
+        }
+
         let mut protocol_registry = ProtocolRegistry::default();
         let _ = protocol_registry.register(
             "urlinfo",
@@ -113,6 +130,9 @@ impl App {
         servo.setup_logging();
 
         let user_content_manager = Rc::new(UserContentManager::new(&servo));
+        if self.bridge.is_some() {
+            user_content_manager.add_script(Rc::new(SeverinBridge::user_script()));
+        }
         for script in load_userscripts(self.servoshell_preferences.userscripts_directory.as_deref())
             .expect("Loading userscripts failed")
         {
@@ -169,8 +189,19 @@ impl App {
 
         let create_platform_window = |url: Url| self.create_platform_window(url, active_event_loop);
         if !state.spin_event_loop(Some(&create_platform_window)) {
+            if let Some(bridge) = &mut self.bridge {
+                bridge.close();
+            }
             self.state = AppState::ShuttingDown;
             return false;
+        }
+        if let Some(bridge) = &mut self.bridge {
+            if let Err(error) = bridge.pump(state.active_or_newest_webview()) {
+                log::error!("Severin bridge pump failed: {error}");
+                bridge.close();
+                state.schedule_exit();
+                return false;
+            }
         }
         true
     }
@@ -200,8 +231,8 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         };
 
-        if let Some(window) = state.window(ServoShellWindowId::from(u64::from(window_id))) &&
-            let Some(headed_window) = window.platform_window().as_headed_window()
+        if let Some(window) = state.window(ServoShellWindowId::from(u64::from(window_id)))
+            && let Some(headed_window) = window.platform_window().as_headed_window()
         {
             headed_window.handle_winit_window_event(state.clone(), window, window_event);
         }
@@ -218,12 +249,35 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         };
 
-        if let Some(window) = app_event
-            .window_id()
-            .and_then(|window_id| state.window(ServoShellWindowId::from(u64::from(window_id)))) &&
-            let Some(headed_window) = window.platform_window().as_headed_window()
-        {
-            headed_window.handle_winit_app_event(state.clone(), app_event);
+        match app_event {
+            AppEvent::SeverinBridge(event) => {
+                if let Some(bridge) = &mut self.bridge {
+                    match bridge.handle_thread_event(event) {
+                        Ok(BridgeEventOutcome::None) => {},
+                        Ok(BridgeEventOutcome::DeliverReply(webview_id, script)) => {
+                            if let Some(webview) = state.webview_by_id(webview_id) {
+                                bridge.schedule_reply_delivery(&webview, script);
+                            } else {
+                                log::warn!("Severin bridge reply target WebView is no longer open");
+                            }
+                        },
+                        Ok(BridgeEventOutcome::CloseShell) => state.schedule_exit(),
+                        Err(error) => {
+                            log::error!("Severin bridge event failed: {error}");
+                            bridge.close();
+                            state.schedule_exit();
+                        },
+                    }
+                }
+            },
+            other_event => {
+                if let Some(window) = other_event.window_id().and_then(|window_id| {
+                    state.window(ServoShellWindowId::from(u64::from(window_id)))
+                }) && let Some(headed_window) = window.platform_window().as_headed_window()
+                {
+                    headed_window.handle_winit_app_event(state.clone(), other_event);
+                }
+            },
         }
 
         if !self.pump_servo_event_loop(event_loop.into()) {
