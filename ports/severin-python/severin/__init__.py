@@ -1,12 +1,13 @@
 """Pure-Python Severin launcher/controller for the headed child runtime.
 
-This module launches the single headed Severin/servoshell executable and talks to
-it only through two inherited anonymous pipe file descriptors. It does not embed
-Servo and does not own the GUI/rendering event loop.
+This module launches the single headed Severin executable and talks to it only
+through two inherited anonymous pipe file descriptors. It does not embed Servo
+and does not own the GUI/rendering event loop.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -20,6 +21,8 @@ from typing import Callable, Optional
 _FRAME_HEADER = struct.Struct(">IQ")
 _DEFAULT_PACKAGE_ID = "com.example.app"
 _DEFAULT_MAX_FRAME_BYTES = 1024 * 1024
+_MAX_BRIDGE_POLL_MS = 60_000
+_MAX_STARTUP_RETRIES = 16
 
 BridgeCallback = Callable[[int, str], Optional[str]]
 
@@ -28,20 +31,78 @@ class SeverinTransportError(RuntimeError):
     """Raised when the private inherited-FD transport is closed or malformed."""
 
 
+@dataclass(frozen=True)
+class BridgeTiming:
+    """Physical polling and startup timing for one private JS↔Python bridge.
+
+    These quantities affect only transport scheduling. They do not define
+    application operation names, JSON schemas, permissions, or reply meanings.
+    """
+
+    idle_poll_ms: int = 100
+    busy_poll_ms: int = 10
+    startup_retry_ms: tuple[int, ...] = (50, 100, 250, 500, 1_000, 2_000)
+
+    def __post_init__(self) -> None:
+        self._validate_delay("idle_poll_ms", self.idle_poll_ms)
+        self._validate_delay("busy_poll_ms", self.busy_poll_ms)
+        try:
+            retry_delays = tuple(self.startup_retry_ms)
+        except TypeError as exc:
+            raise TypeError("startup_retry_ms must be an iterable of integer milliseconds") from exc
+        if not retry_delays or len(retry_delays) > _MAX_STARTUP_RETRIES:
+            raise ValueError(
+                f"startup_retry_ms must contain between 1 and {_MAX_STARTUP_RETRIES} delays"
+            )
+        for delay in retry_delays:
+            self._validate_delay("startup_retry_ms", delay)
+        object.__setattr__(self, "startup_retry_ms", retry_delays)
+
+    @staticmethod
+    def _validate_delay(name: str, value: int) -> None:
+        if type(value) is not int:
+            raise TypeError(f"{name} values must be integers")
+        if value <= 0 or value > _MAX_BRIDGE_POLL_MS:
+            raise ValueError(
+                f"{name} values must be between 1 and {_MAX_BRIDGE_POLL_MS} milliseconds"
+            )
+
+    def _child_args(self) -> list[str]:
+        retry_schedule = ",".join(str(delay) for delay in self.startup_retry_ms)
+        return [
+            f"--bridge-idle-poll-ms={self.idle_poll_ms}",
+            f"--bridge-busy-poll-ms={self.busy_poll_ms}",
+            f"--bridge-startup-retry-ms={retry_schedule}",
+        ]
+
+
 class App:
-    def __init__(self, *, width: int = 800, height: int = 600, bridge: BridgeCallback | None = None,
-                 executable: str | os.PathLike[str] | None = None, package_id: str = _DEFAULT_PACKAGE_ID,
-                 max_frame_bytes: int = _DEFAULT_MAX_FRAME_BYTES) -> None:
+    def __init__(
+        self,
+        *,
+        width: int = 800,
+        height: int = 600,
+        bridge: BridgeCallback | None = None,
+        executable: str | os.PathLike[str] | None = None,
+        package_id: str = _DEFAULT_PACKAGE_ID,
+        max_frame_bytes: int = _DEFAULT_MAX_FRAME_BYTES,
+        bridge_timing: BridgeTiming | None = None,
+    ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive")
         if max_frame_bytes <= 0 or max_frame_bytes > 0xFFFF_FFFF:
             raise ValueError("max_frame_bytes must fit in u32 and be positive")
+        if bridge_timing is not None and not isinstance(bridge_timing, BridgeTiming):
+            raise TypeError("bridge_timing must be a BridgeTiming instance or None")
+
         self.width = int(width)
         self.height = int(height)
         self.bridge = bridge
         self.executable = str(executable or os.environ.get("SEVERIN_EXECUTABLE", "severin"))
         self.package_id = package_id
         self.max_frame_bytes = int(max_frame_bytes)
+        self.bridge_timing = bridge_timing or BridgeTiming()
+
         self._package_root: Path | None = None
         self._entry: str | None = None
         self._process: subprocess.Popen[bytes] | None = None
@@ -79,6 +140,7 @@ class App:
                     f"--severin-entry={self._entry}",
                     f"--bridge-request-fd={request_write}",
                     f"--bridge-reply-fd={reply_read}",
+                    *self.bridge_timing._child_args(),
                     f"--window-size={self.width}x{self.height}",
                     "--no-egui",
                 ]
@@ -92,7 +154,11 @@ class App:
                 os.close(reply_read)
             self._request_fd = request_read
             self._reply_fd = reply_write
-            self._writer = threading.Thread(target=self._writer_main, name="severin-reply-writer", daemon=True)
+            self._writer = threading.Thread(
+                target=self._writer_main,
+                name="severin-reply-writer",
+                daemon=True,
+            )
             self._writer.start()
         try:
             self._reader_main(request_read)
@@ -170,13 +236,16 @@ class App:
             return
         try:
             reply = self.bridge(receipt, json_text)
-        except Exception:  # deliberately transport-neutral: do not invent application JSON.
+        except Exception:  # Transport-neutral: do not invent application JSON.
             logging.exception("Severin bridge callback failed for receipt %s", receipt)
             return
         if reply is None:
             return
         if not isinstance(reply, str):
-            logging.error("Severin bridge callback returned non-str for receipt %s; leaving unresolved", receipt)
+            logging.error(
+                "Severin bridge callback returned non-str for receipt %s; leaving unresolved",
+                receipt,
+            )
             return
         self.write(receipt, reply)
 
