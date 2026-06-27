@@ -26,10 +26,34 @@ use url::Url;
 
 use crate::VERSION;
 
-#[derive(Clone, Copy, Debug)]
+const MAX_BRIDGE_POLL_MS: u64 = 60_000;
+const MAX_BRIDGE_STARTUP_RETRIES: usize = 16;
+
+#[derive(Clone, Debug)]
+pub(crate) struct BridgeTimingConfig {
+    /// Delay after a successful drain that found no additional queued page messages.
+    pub idle_poll_ms: u64,
+    /// Delay after a successful drain that reports page messages still queued.
+    pub busy_poll_ms: u64,
+    /// Bounded retry delays used only while the initial page-side drain helper is unavailable.
+    pub startup_retry_ms: Vec<u64>,
+}
+
+impl Default for BridgeTimingConfig {
+    fn default() -> Self {
+        Self {
+            idle_poll_ms: 100,
+            busy_poll_ms: 10,
+            startup_retry_ms: vec![50, 100, 250, 500, 1_000, 2_000],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct BridgeFdConfig {
     pub request_fd: i32,
     pub reply_fd: i32,
+    pub timing: BridgeTimingConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -405,6 +429,77 @@ fn map_debug_options(arg: String) -> Vec<String> {
     arg.split(',').map(|s| s.to_owned()).collect()
 }
 
+fn validate_bridge_delay(name: &str, value: u64) -> Result<u64, String> {
+    if value == 0 || value > MAX_BRIDGE_POLL_MS {
+        return Err(format!(
+            "{name} must be between 1 and {MAX_BRIDGE_POLL_MS} milliseconds"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_bridge_startup_retry_schedule(value: String) -> Result<Vec<u64>, String> {
+    let mut delays = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(
+                "--bridge-startup-retry-ms must be a comma-separated list of positive milliseconds"
+                    .to_owned(),
+            );
+        }
+        let delay = part.parse::<u64>().map_err(|error| {
+            format!("invalid --bridge-startup-retry-ms value {part:?}: {error}")
+        })?;
+        delays.push(validate_bridge_delay("--bridge-startup-retry-ms", delay)?);
+    }
+    if delays.is_empty() || delays.len() > MAX_BRIDGE_STARTUP_RETRIES {
+        return Err(format!(
+            "--bridge-startup-retry-ms must contain between 1 and {MAX_BRIDGE_STARTUP_RETRIES} delays"
+        ));
+    }
+    Ok(delays)
+}
+
+fn bridge_timing_requested(cmd_args: &CmdArgs) -> bool {
+    cmd_args.bridge_idle_poll_ms.is_some()
+        || cmd_args.bridge_busy_poll_ms.is_some()
+        || cmd_args.bridge_startup_retry_ms.is_some()
+}
+
+fn bridge_timing_from_command_line(
+    cmd_args: &CmdArgs,
+) -> Result<BridgeTimingConfig, String> {
+    let defaults = BridgeTimingConfig::default();
+    let idle_poll_ms = validate_bridge_delay(
+        "--bridge-idle-poll-ms",
+        cmd_args.bridge_idle_poll_ms.unwrap_or(defaults.idle_poll_ms),
+    )?;
+    let busy_poll_ms = validate_bridge_delay(
+        "--bridge-busy-poll-ms",
+        cmd_args.bridge_busy_poll_ms.unwrap_or(defaults.busy_poll_ms),
+    )?;
+    let startup_retry_ms = cmd_args
+        .bridge_startup_retry_ms
+        .clone()
+        .unwrap_or(defaults.startup_retry_ms);
+
+    if startup_retry_ms.is_empty() || startup_retry_ms.len() > MAX_BRIDGE_STARTUP_RETRIES {
+        return Err(format!(
+            "--bridge-startup-retry-ms must contain between 1 and {MAX_BRIDGE_STARTUP_RETRIES} delays"
+        ));
+    }
+    for &delay in &startup_retry_ms {
+        validate_bridge_delay("--bridge-startup-retry-ms", delay)?;
+    }
+
+    Ok(BridgeTimingConfig {
+        idle_poll_ms,
+        busy_poll_ms,
+        startup_retry_ms,
+    })
+}
+
 #[derive(Bpaf, Clone, Debug)]
 #[bpaf(options, version(VERSION), usage("severin [OPTIONS] URL"))]
 // Newlines in comments are intentional to have the right formatting for the help message.
@@ -620,6 +715,22 @@ struct CmdArgs {
     #[bpaf(long("bridge-reply-fd"), argument("FD"))]
     bridge_reply_fd: Option<i32>,
 
+    /// Milliseconds between bridge drain polls once the page-side bridge is idle.
+    #[bpaf(long("bridge-idle-poll-ms"), argument::<u64>("MS"))]
+    bridge_idle_poll_ms: Option<u64>,
+
+    /// Milliseconds between bridge drain polls while page-side bridge messages remain queued.
+    #[bpaf(long("bridge-busy-poll-ms"), argument::<u64>("MS"))]
+    bridge_busy_poll_ms: Option<u64>,
+
+    /// Comma-separated bounded startup retry delays in milliseconds for the page-side bridge drain.
+    #[bpaf(
+        long("bridge-startup-retry-ms"),
+        argument::<String>("MS,MS,..."),
+        parse(parse_bridge_startup_retry_schedule)
+    )]
+    bridge_startup_retry_ms: Option<Vec<u64>>,
+
     /// Severin package id for asset:// package mode.
     #[bpaf(long("severin-package-id"), argument("PACKAGE"))]
     severin_package_id: Option<String>,
@@ -766,12 +877,29 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         (Some(request_fd), Some(reply_fd))
             if request_fd >= 3 && reply_fd >= 3 && request_fd != reply_fd =>
         {
+            let timing = match bridge_timing_from_command_line(&cmd_args) {
+                Ok(timing) => timing,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return ArgumentParsingResult::ErrorParsing;
+                },
+            };
             Some(BridgeFdConfig {
                 request_fd,
                 reply_fd,
+                timing,
             })
         },
-        (None, None) => None,
+        (None, None) => {
+            if bridge_timing_requested(&cmd_args) {
+                eprintln!(
+                    "--bridge-idle-poll-ms, --bridge-busy-poll-ms, and \
+                     --bridge-startup-retry-ms require bridge FD mode"
+                );
+                return ArgumentParsingResult::ErrorParsing;
+            }
+            None
+        },
         (Some(_), Some(_)) => {
             eprintln!(
                 "--bridge-request-fd and --bridge-reply-fd must be distinct FDs greater than or equal to 3"
