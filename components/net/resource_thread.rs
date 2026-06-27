@@ -205,6 +205,7 @@ fn local_runtime_package_decision(
         },
         "file" => return LocalRuntimePackageDecision::Deny("FileSchemeDeniedByLocalRuntime"),
         "store" => return LocalRuntimePackageDecision::Deny("StoreSchemeDeniedByLocalRuntime"),
+        "data" => return LocalRuntimePackageDecision::NotHandled,
         "asset" => {},
         _ => {
             return LocalRuntimePackageDecision::Unsupported("UnsupportedSchemeInPackageMode");
@@ -1399,6 +1400,34 @@ mod local_runtime_package_wall_tests {
     }
 
     #[test]
+    fn package_mode_allows_data_scheme_to_existing_loader() {
+        let root = fixture_root();
+        let mode = package_mode(root.clone());
+        let probes = [
+            "data:text/plain,hello",
+            "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+            "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2w==",
+            "data:application/x-font-woff;base64,d09GRg==",
+            "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E",
+        ];
+
+        for url in probes {
+            match local_runtime_package_decision(&ServoUrl::parse(url).unwrap(), Some(&mode)) {
+                LocalRuntimePackageDecision::NotHandled => {},
+                LocalRuntimePackageDecision::Deny(reason)
+                | LocalRuntimePackageDecision::Unsupported(reason) => {
+                    panic!("{url} was rejected in package mode: {reason}")
+                },
+                LocalRuntimePackageDecision::Allow(_) => {
+                    panic!("{url} was incorrectly rewritten as a package asset")
+                },
+            }
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn package_mode_classifies_all_non_asset_fallthroughs() {
         let root = fixture_root();
         let mode = package_mode(root.clone());
@@ -1407,7 +1436,6 @@ mod local_runtime_package_wall_tests {
             "asset://com.example.app/../secret.txt",
             "asset://com.example.app/%2e%2e/secret.txt",
             "bundle://runtime/default.css",
-            "data:text/plain,hello",
             "blob:https://example.test/id",
         ];
 

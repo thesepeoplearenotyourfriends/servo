@@ -1090,3 +1090,13 @@ The pending source work is therefore:
 
 
 
+
+## 2026-06-27 — Package-mode data URLs and bridge retry default
+
+- Inspected `components/net/resource_thread.rs` package-mode policy after headed Movies UI probes showed `UnsupportedSchemeInPackageMode` for `fetch("data:text/plain,hello")` and a minimal data GIF.
+- Verified prior condition: in `local_runtime_package_decision`, package mode allowed only `asset:` to continue into package asset handling; all other schemes not explicitly denied, including `data:`, returned `Unsupported("UnsupportedSchemeInPackageMode")` before Servo's existing data URL loader could run.
+- Changed package-mode policy so `data:` returns `NotHandled`, which deliberately leaves self-contained data URLs on Servo's existing data URL fetch/resource path. This does not rewrite `data:` into `asset:`, does not grant package asset authority, and leaves `http:`, `https:`, `ws:`, `wss:`, `file:`, `store:`, cross-package `asset:`, and package path traversal denied at the package wall.
+- Added focused policy regression coverage for data text, GIF, JPEG, WOFF, and SVG data URLs; existing package asset and forbidden-scheme tests continue to cover package resources and external-scheme blocking at the same package-mode decision layer.
+- Inspected `ports/servoshell/prefs.rs` for the headed runtime bridge startup regression. The cause was the optional `--bridge-startup-retry-ms` parser lacking an explicit `fallback(None)`, which made the option mandatory at bpaf parse time even for no-bridge launches.
+- Added the missing CLI fallback and parser regression coverage showing `--no-egui ./index.html` starts with no `severin_bridge_fds`, while a bridge-FD launch with `--bridge-startup-retry-ms=7,11` still accepts and preserves the explicit schedule.
+- Deferred validation: no broad Servo workspace checks were run; only targeted package/crate tests were attempted for the touched seams.
