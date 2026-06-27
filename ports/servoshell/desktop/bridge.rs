@@ -12,7 +12,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use servo::{JSValue, JavaScriptEvaluationError, UserScript, WebView, WebViewId};
@@ -23,6 +23,14 @@ use crate::prefs::BridgeFdConfig;
 
 const FRAME_HEADER_BYTES: usize = 12;
 const READ_CHUNK_BYTES: usize = 8192;
+const DRAIN_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1_000),
+    Duration::from_millis(2_000),
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct BridgeLimits {
@@ -71,6 +79,7 @@ pub(crate) struct BridgeFrame {
 pub(crate) enum BridgeThreadEvent {
     Reply(BridgeFrame),
     Closed(String),
+    RetryDrain(u64),
 }
 
 pub(crate) enum BridgeEventOutcome {
@@ -253,7 +262,12 @@ struct PendingEvaluation {
 pub(crate) struct SeverinBridge {
     transport: BridgeTransport,
     writer: Option<SyncSender<BridgeFrame>>,
+    proxy: EventLoopProxy<AppEvent>,
     pending_evaluations: Vec<PendingEvaluation>,
+    drain_retry_generation: u64,
+    drain_retry_count: usize,
+    drain_retry_pending: bool,
+    drain_polling_disabled: bool,
     closed: bool,
 }
 
@@ -269,11 +283,16 @@ impl SeverinBridge {
             limits.max_queued_bytes,
             proxy.clone(),
         );
-        spawn_request_writer(config.request_fd, rx, proxy);
+        spawn_request_writer(config.request_fd, rx, proxy.clone());
         Self {
             transport: BridgeTransport::new(limits),
             writer: Some(tx),
+            proxy,
             pending_evaluations: Vec::new(),
+            drain_retry_generation: 0,
+            drain_retry_count: 0,
+            drain_retry_pending: false,
+            drain_polling_disabled: false,
             closed: false,
         }
     }
@@ -285,6 +304,7 @@ impl SeverinBridge {
     pub(crate) fn clear_for_navigation(&mut self) {
         self.pending_evaluations.clear();
         self.transport.clear();
+        self.reset_drain_retry_for_navigation();
     }
 
     pub(crate) fn close(&mut self) {
@@ -311,6 +331,15 @@ impl SeverinBridge {
                 self.close();
                 Ok(BridgeEventOutcome::CloseShell)
             },
+            BridgeThreadEvent::RetryDrain(generation) => {
+                if !self.closed
+                    && generation == self.drain_retry_generation
+                    && self.drain_retry_pending
+                {
+                    self.drain_retry_pending = false;
+                }
+                Ok(BridgeEventOutcome::None)
+            },
         }
     }
 
@@ -323,7 +352,7 @@ impl SeverinBridge {
             return Ok(());
         };
         self.collect_bridge_evaluations(&webview)?;
-        if !self.closed {
+        if !self.closed && !self.drain_retry_pending && !self.drain_polling_disabled {
             self.schedule_outbound_drain(&webview);
         }
         Ok(())
@@ -425,7 +454,12 @@ impl SeverinBridge {
                     "Severin bridge drain evaluation returned unexpected value: {value:?}"
                 ));
             },
-            Err(error) => return Err(format!("Severin bridge drain evaluation failed: {error:?}")),
+            Err(error) => {
+                self.defer_drain_retry(format!(
+                    "JavaScript evaluation failed before the bridge drain completed: {error:?}"
+                ));
+                return Ok(());
+            },
         };
         let drained: serde_json::Value = serde_json::from_str(&serialized)
             .map_err(|error| format!("invalid Severin bridge drain result: {error}"))?;
@@ -451,8 +485,12 @@ impl SeverinBridge {
             .unwrap_or_default()
             .to_owned();
         if document_id.is_empty() {
+            self.defer_drain_retry(
+                "the bridge drain helper is not present in the current JavaScript realm".to_owned(),
+            );
             return Ok(());
         }
+        self.reset_drain_retry_after_success();
         self.transport.observe_document(&document_id);
         let Some(frames) = drained.get("frames").and_then(|value| value.as_array()) else {
             return Err("Severin bridge drain result did not contain a frames array".to_owned());
@@ -510,6 +548,65 @@ impl SeverinBridge {
             }
         }
         Ok(())
+    }
+
+    fn reset_drain_retry_for_navigation(&mut self) {
+        self.drain_retry_generation = self.drain_retry_generation.wrapping_add(1);
+        self.drain_retry_count = 0;
+        self.drain_retry_pending = false;
+        self.drain_polling_disabled = false;
+    }
+
+    fn reset_drain_retry_after_success(&mut self) {
+        self.drain_retry_count = 0;
+        self.drain_retry_pending = false;
+        self.drain_polling_disabled = false;
+    }
+
+    fn defer_drain_retry(&mut self, reason: String) {
+        if self.closed || self.drain_retry_pending || self.drain_polling_disabled {
+            return;
+        }
+
+        let retry_number = self.drain_retry_count + 1;
+        let Some(delay) = DRAIN_RETRY_DELAYS.get(self.drain_retry_count).copied() else {
+            self.drain_polling_disabled = true;
+            warn!(
+                "Severin bridge outbound drain remained unavailable after {} bounded retries;                  automatic drain polling is disabled for this document while the window remains open: {}",
+                self.drain_retry_count,
+                reason
+            );
+            return;
+        };
+
+        self.drain_retry_count = retry_number;
+        self.drain_retry_pending = true;
+        let generation = self.drain_retry_generation;
+        let proxy = self.proxy.clone();
+        debug!(
+            "Severin bridge outbound drain unavailable; retry {}/{} in {:?}: {}",
+            retry_number,
+            DRAIN_RETRY_DELAYS.len(),
+            delay,
+            reason
+        );
+
+        let spawn_result = thread::Builder::new()
+            .name("severin-bridge-drain-retry".to_owned())
+            .spawn(move || {
+                thread::sleep(delay);
+                let _ = proxy.send_event(AppEvent::SeverinBridge(
+                    BridgeThreadEvent::RetryDrain(generation),
+                ));
+            });
+
+        if let Err(error) = spawn_result {
+            self.drain_retry_pending = false;
+            self.drain_polling_disabled = true;
+            warn!(
+                "Severin bridge could not schedule a delayed outbound-drain retry;                  automatic drain polling is disabled for this document while the window remains open: {error}"
+            );
+        }
     }
 }
 
