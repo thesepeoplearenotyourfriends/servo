@@ -467,17 +467,19 @@ fn bridge_timing_requested(cmd_args: &CmdArgs) -> bool {
         || cmd_args.bridge_startup_retry_ms.is_some()
 }
 
-fn bridge_timing_from_command_line(
-    cmd_args: &CmdArgs,
-) -> Result<BridgeTimingConfig, String> {
+fn bridge_timing_from_command_line(cmd_args: &CmdArgs) -> Result<BridgeTimingConfig, String> {
     let defaults = BridgeTimingConfig::default();
     let idle_poll_ms = validate_bridge_delay(
         "--bridge-idle-poll-ms",
-        cmd_args.bridge_idle_poll_ms.unwrap_or(defaults.idle_poll_ms),
+        cmd_args
+            .bridge_idle_poll_ms
+            .unwrap_or(defaults.idle_poll_ms),
     )?;
     let busy_poll_ms = validate_bridge_delay(
         "--bridge-busy-poll-ms",
-        cmd_args.bridge_busy_poll_ms.unwrap_or(defaults.busy_poll_ms),
+        cmd_args
+            .bridge_busy_poll_ms
+            .unwrap_or(defaults.busy_poll_ms),
     )?;
     let startup_retry_ms = cmd_args
         .bridge_startup_retry_ms
@@ -727,7 +729,8 @@ struct CmdArgs {
     #[bpaf(
         long("bridge-startup-retry-ms"),
         argument::<String>("MS,MS,..."),
-        parse(parse_bridge_startup_retry_schedule)
+        parse(parse_bridge_startup_retry_schedule),
+        fallback(None)
     )]
     bridge_startup_retry_ms: Option<Vec<u64>>,
 
@@ -1130,6 +1133,23 @@ fn test_parse(arg: &str) -> (Opts, Preferences, ServoShellPreferences) {
             unreachable!("We always have valid preference in our test cases")
         },
     }
+}
+
+#[test]
+fn test_severin_bridge_timing_defaults_only_with_bridge_fds() {
+    let (_, _, prefs) = test_parse("--no-egui ./index.html");
+    assert!(prefs.no_egui);
+    assert!(prefs.severin_bridge_fds.is_none());
+
+    let (_, _, prefs) = test_parse(
+        "--bridge-request-fd=3 --bridge-reply-fd=4 --bridge-startup-retry-ms=7,11 ./index.html",
+    );
+    let bridge = prefs
+        .severin_bridge_fds
+        .expect("bridge FDs should enable bridge mode");
+    assert_eq!(bridge.request_fd, 3);
+    assert_eq!(bridge.reply_fd, 4);
+    assert_eq!(bridge.timing.startup_retry_ms, vec![7, 11]);
 }
 
 #[test]
