@@ -994,3 +994,99 @@ The bridge remains a receipt mailbox, not a fetch path, listener, network servic
 - Tightened child bridge FD validation to reject stdio FDs and marked adopted bridge FDs close-on-exec in the child before worker adoption.
 - Bound pending bridge receipts to the originating `WebViewId` in addition to document id and call id, so replies are not routed through active/newest WebView fallback.
 - Updated visible executable/artifact consumers found in desktop packaging paths from `servoshell` executable names to `severin` where they refer to the headed desktop artifact.
+
+## 2026-06-27 — Current headed Python runtime, local launch policy, and IndexedDB finding
+
+### Normal local runtime shape
+
+The normal visible Severin runtime is now a headed `severin` child controlled from ordinary Python:
+
+```python
+import severin
+
+def bridge(receipt, json_text):
+    return '{"ok":true}'
+
+app = severin.App(
+    width=800,
+    height=600,
+    bridge=bridge,
+)
+app.load_path("./index.html")
+app.run()
+```
+
+`app.run()` owns the visible application lifetime. Python does not pump pixels, own the native window loop, or need a normal `pump()` loop for this headed path. The native child owns its window/event/render loop; Python owns controller behavior and the optional bridge callback.
+
+The bridge remains a receipt-based arbitrary-JSON mailbox, not an application protocol. The native layer does not define actions, capabilities, schemas, or application semantics. Immediate callback replies return JSON text; deferred replies remain possible through the receipt/write path.
+
+The local Python controller selects its headed executable through `SEVERIN_EXECUTABLE`. A local wrapper currently launches the built `bin/severin` with:
+
+```text
+--bridge-startup-retry-ms=50,100,250,500,1000,2000
+--enable-experimental-web-platform-features
+```
+
+The bridge retry setting is a local startup workaround/configuration layer. It is not part of the application bridge protocol.
+
+### IndexedDB observed status
+
+With experimental features disabled, IndexedDB was not exposed in the local document realm.
+
+With the current experimental wrapper enabled, IndexedDB DOM objects are exposed, including `indexedDB`, `IDBFactory`, `IDBDatabase`, transactions, object stores, indexes, requests, key ranges, and cursors.
+
+However, the first real call:
+
+```js
+indexedDB.open(...)
+```
+
+fails immediately with:
+
+```text
+SecurityError: The operation is insecure.
+```
+
+This means the current blocker occurs before database creation, SQLite/backend work, transaction behavior, persistence-across-restart, or isolation behavior can be tested.
+
+Adding an explicit IndexedDB preference alongside experimental mode did not change that result. The next source-level task is to locate the precise security/origin check rejecting the current Severin local document context.
+
+### Intended local runtime storage model — not implemented yet
+
+Persistent browser-ish runtime state should belong to the launch context, visibly and locally:
+
+```text
+runtime root = process working directory at launch
+cache root   = runtime root / ".cache"
+entry page   = whichever local document App.load_path() loads
+```
+
+The loaded document path is content, not storage identity.
+
+A caller can intentionally run the same source document from another working directory to obtain another state world:
+
+```sh
+cd /app/root
+launch index.html
+# persistent state: /app/root/.cache
+```
+
+```sh
+cd /tmp/scratch-run
+launch /app/root/index.html
+# persistent state: /tmp/scratch-run/.cache
+```
+
+Nested documents, scripts, and resources loaded after startup remain in the original launch world and share its `.cache`. The runtime does not recalculate storage identity from whichever nested file happens to be active later.
+
+This is a launch convention, not a sandbox or protection against sloppy invocation. Running a document from the wrong working directory intentionally gives it that directory's runtime context. Apps that need durable normal state should launch from their intended root; temporary/scratch runs should launch from a temporary working directory.
+
+The pending source work is therefore:
+
+1. establish one local runtime storage context from the launch working directory;
+2. route host-managed persistent state to `$PWD/.cache`;
+3. allow that Severin-created local context to use offline storage APIs such as IndexedDB;
+4. do so without implying network authority or turning arbitrary local URLs into globally trusted web origins.
+
+
+
