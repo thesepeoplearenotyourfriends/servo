@@ -10,7 +10,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{FromRawFd, RawFd};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{
+    Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError, channel, sync_channel,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,18 +21,10 @@ use servo::{JSValue, JavaScriptEvaluationError, UserScript, WebView, WebViewId};
 use winit::event_loop::EventLoopProxy;
 
 use super::event_loop::AppEvent;
-use crate::prefs::BridgeFdConfig;
+use crate::prefs::{BridgeFdConfig, BridgeTimingConfig};
 
 const FRAME_HEADER_BYTES: usize = 12;
 const READ_CHUNK_BYTES: usize = 8192;
-const DRAIN_RETRY_DELAYS: [Duration; 6] = [
-    Duration::from_millis(50),
-    Duration::from_millis(100),
-    Duration::from_millis(250),
-    Duration::from_millis(500),
-    Duration::from_millis(1_000),
-    Duration::from_millis(2_000),
-];
 
 #[derive(Clone, Debug)]
 pub(crate) struct BridgeLimits {
@@ -79,7 +73,7 @@ pub(crate) struct BridgeFrame {
 pub(crate) enum BridgeThreadEvent {
     Reply(BridgeFrame),
     Closed(String),
-    RetryDrain(u64),
+    PollDrain(u64),
 }
 
 pub(crate) enum BridgeEventOutcome {
@@ -235,13 +229,17 @@ impl BridgeTransport {
         self.last_refill = Instant::now();
     }
 
-    fn observe_document(&mut self, document_id: &str) {
+    fn observe_document(&mut self, document_id: &str) -> bool {
         match self.active_document_id.as_deref() {
-            None => self.active_document_id = Some(document_id.to_owned()),
-            Some(active) if active == document_id => {},
+            None => {
+                self.active_document_id = Some(document_id.to_owned());
+                false
+            },
+            Some(active) if active == document_id => false,
             Some(_) => {
                 self.clear();
                 self.active_document_id = Some(document_id.to_owned());
+                true
             },
         }
     }
@@ -259,42 +257,81 @@ struct PendingEvaluation {
     result: std::rc::Rc<std::cell::RefCell<Option<Result<JSValue, JavaScriptEvaluationError>>>>,
 }
 
+struct DrainTiming {
+    idle_poll: Duration,
+    busy_poll: Duration,
+    startup_retry_delays: Vec<Duration>,
+}
+
+impl From<BridgeTimingConfig> for DrainTiming {
+    fn from(config: BridgeTimingConfig) -> Self {
+        Self {
+            idle_poll: Duration::from_millis(config.idle_poll_ms),
+            busy_poll: Duration::from_millis(config.busy_poll_ms),
+            startup_retry_delays: config
+                .startup_retry_ms
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect(),
+        }
+    }
+}
+
+enum DrainTimerCommand {
+    Schedule { generation: u64, delay: Duration },
+}
+
 pub(crate) struct SeverinBridge {
     transport: BridgeTransport,
     writer: Option<SyncSender<BridgeFrame>>,
-    proxy: EventLoopProxy<AppEvent>,
+    drain_timer: Option<Sender<DrainTimerCommand>>,
+    timing: DrainTiming,
     pending_evaluations: Vec<PendingEvaluation>,
-    drain_retry_generation: u64,
-    drain_retry_count: usize,
-    drain_retry_pending: bool,
+    drain_generation: u64,
+    drain_due: bool,
+    startup_retry_index: usize,
     drain_polling_disabled: bool,
     closed: bool,
 }
 
 impl SeverinBridge {
     pub(crate) fn new(config: BridgeFdConfig, proxy: EventLoopProxy<AppEvent>) -> Self {
-        set_close_on_exec(config.request_fd);
-        set_close_on_exec(config.reply_fd);
+        let BridgeFdConfig {
+            request_fd,
+            reply_fd,
+            timing,
+        } = config;
+
+        set_close_on_exec(request_fd);
+        set_close_on_exec(reply_fd);
+
         let limits = BridgeLimits::default();
-        let (tx, rx) = sync_channel(limits.max_queued_frames);
+        let (writer_tx, writer_rx) = sync_channel(limits.max_queued_frames);
+        let (timer_tx, timer_rx) = channel();
+
+        spawn_drain_timer(timer_rx, proxy.clone());
         spawn_reply_reader(
-            config.reply_fd,
+            reply_fd,
             limits.max_frame_bytes,
             limits.max_queued_bytes,
             proxy.clone(),
         );
-        spawn_request_writer(config.request_fd, rx, proxy.clone());
-        Self {
+        spawn_request_writer(request_fd, writer_rx, proxy);
+
+        let mut bridge = Self {
             transport: BridgeTransport::new(limits),
-            writer: Some(tx),
-            proxy,
+            writer: Some(writer_tx),
+            drain_timer: Some(timer_tx),
+            timing: DrainTiming::from(timing),
             pending_evaluations: Vec::new(),
-            drain_retry_generation: 0,
-            drain_retry_count: 0,
-            drain_retry_pending: false,
+            drain_generation: 0,
+            drain_due: false,
+            startup_retry_index: 0,
             drain_polling_disabled: false,
             closed: false,
-        }
+        };
+        bridge.schedule_drain_after(Duration::ZERO);
+        bridge
     }
 
     pub(crate) fn user_script() -> UserScript {
@@ -304,13 +341,21 @@ impl SeverinBridge {
     pub(crate) fn clear_for_navigation(&mut self) {
         self.pending_evaluations.clear();
         self.transport.clear();
-        self.reset_drain_retry_for_navigation();
+        self.reset_drain_state();
+        self.schedule_drain_after(Duration::ZERO);
     }
 
     pub(crate) fn close(&mut self) {
+        if self.closed {
+            return;
+        }
         self.closed = true;
         self.writer.take();
-        self.clear_for_navigation();
+        self.drain_timer.take();
+        self.pending_evaluations.clear();
+        self.transport.clear();
+        self.drain_generation = self.drain_generation.wrapping_add(1);
+        self.drain_due = false;
     }
 
     pub(crate) fn handle_thread_event(
@@ -331,12 +376,12 @@ impl SeverinBridge {
                 self.close();
                 Ok(BridgeEventOutcome::CloseShell)
             },
-            BridgeThreadEvent::RetryDrain(generation) => {
+            BridgeThreadEvent::PollDrain(generation) => {
                 if !self.closed
-                    && generation == self.drain_retry_generation
-                    && self.drain_retry_pending
+                    && !self.drain_polling_disabled
+                    && generation == self.drain_generation
                 {
-                    self.drain_retry_pending = false;
+                    self.drain_due = true;
                 }
                 Ok(BridgeEventOutcome::None)
             },
@@ -352,18 +397,25 @@ impl SeverinBridge {
             return Ok(());
         };
         self.collect_bridge_evaluations(&webview)?;
-        if !self.closed && !self.drain_retry_pending && !self.drain_polling_disabled {
+        if !self.closed
+            && !self.drain_polling_disabled
+            && self.drain_due
+            && !self.has_pending_drain()
+        {
+            self.drain_due = false;
             self.schedule_outbound_drain(&webview);
         }
         Ok(())
     }
 
-    fn schedule_outbound_drain(&mut self, webview: &WebView) {
-        if self
-            .pending_evaluations
+    fn has_pending_drain(&self) -> bool {
+        self.pending_evaluations
             .iter()
             .any(|evaluation| matches!(evaluation.kind, PendingEvaluationKind::DrainOutbound))
-        {
+    }
+
+    fn schedule_outbound_drain(&mut self, webview: &WebView) {
+        if self.has_pending_drain() {
             return;
         }
         let result = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -455,7 +507,7 @@ impl SeverinBridge {
                 ));
             },
             Err(error) => {
-                self.defer_drain_retry(format!(
+                self.schedule_startup_retry(format!(
                     "JavaScript evaluation failed before the bridge drain completed: {error:?}"
                 ));
                 return Ok(());
@@ -479,22 +531,34 @@ impl SeverinBridge {
                     .saturating_add(backpressure);
             }
         }
+
         let document_id = drained
             .get("documentId")
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_owned();
         if document_id.is_empty() {
-            self.defer_drain_retry(
+            self.schedule_startup_retry(
                 "the bridge drain helper is not present in the current JavaScript realm".to_owned(),
             );
             return Ok(());
         }
-        self.reset_drain_retry_after_success();
-        self.transport.observe_document(&document_id);
+
+        let document_changed = self.transport.observe_document(&document_id);
+        if document_changed {
+            self.pending_evaluations.clear();
+            self.reset_drain_state();
+        }
+        self.reset_startup_retry_after_success();
+
         let Some(frames) = drained.get("frames").and_then(|value| value.as_array()) else {
             return Err("Severin bridge drain result did not contain a frames array".to_owned());
         };
+        let queued_remaining = drained
+            .get("queuedRemaining")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+
         let webview_id = webview.id();
         for frame in frames {
             let Some(call_id) = frame.get("callId").and_then(|value| value.as_u64()) else {
@@ -547,67 +611,128 @@ impl SeverinBridge {
                 },
             }
         }
+
+        if !self.closed && !self.drain_polling_disabled {
+            let delay = if queued_remaining > 0 {
+                self.timing.busy_poll
+            } else {
+                self.timing.idle_poll
+            };
+            self.schedule_drain_after(delay);
+        }
         Ok(())
     }
 
-    fn reset_drain_retry_for_navigation(&mut self) {
-        self.drain_retry_generation = self.drain_retry_generation.wrapping_add(1);
-        self.drain_retry_count = 0;
-        self.drain_retry_pending = false;
+    fn reset_drain_state(&mut self) {
+        self.drain_generation = self.drain_generation.wrapping_add(1);
+        self.drain_due = false;
+        self.startup_retry_index = 0;
         self.drain_polling_disabled = false;
     }
 
-    fn reset_drain_retry_after_success(&mut self) {
-        self.drain_retry_count = 0;
-        self.drain_retry_pending = false;
+    fn reset_startup_retry_after_success(&mut self) {
+        self.startup_retry_index = 0;
         self.drain_polling_disabled = false;
     }
 
-    fn defer_drain_retry(&mut self, reason: String) {
-        if self.closed || self.drain_retry_pending || self.drain_polling_disabled {
+    fn schedule_startup_retry(&mut self, reason: String) {
+        if self.closed || self.drain_polling_disabled {
             return;
         }
 
-        let retry_number = self.drain_retry_count + 1;
-        let Some(delay) = DRAIN_RETRY_DELAYS.get(self.drain_retry_count).copied() else {
+        let retry_number = self.startup_retry_index + 1;
+        let Some(delay) = self
+            .timing
+            .startup_retry_delays
+            .get(self.startup_retry_index)
+            .copied()
+        else {
             self.drain_polling_disabled = true;
             warn!(
-                "Severin bridge outbound drain remained unavailable after {} bounded retries;                  automatic drain polling is disabled for this document while the window remains open: {}",
-                self.drain_retry_count,
+                "Severin bridge outbound drain remained unavailable after {} bounded retries; \
+                 automatic drain polling is disabled for this document while the window remains open: {}",
+                self.startup_retry_index,
                 reason
             );
             return;
         };
 
-        self.drain_retry_count = retry_number;
-        self.drain_retry_pending = true;
-        let generation = self.drain_retry_generation;
-        let proxy = self.proxy.clone();
+        self.startup_retry_index = retry_number;
         debug!(
             "Severin bridge outbound drain unavailable; retry {}/{} in {:?}: {}",
             retry_number,
-            DRAIN_RETRY_DELAYS.len(),
+            self.timing.startup_retry_delays.len(),
             delay,
             reason
         );
+        self.schedule_drain_after(delay);
+    }
 
-        let spawn_result = thread::Builder::new()
-            .name("severin-bridge-drain-retry".to_owned())
-            .spawn(move || {
-                thread::sleep(delay);
-                let _ = proxy.send_event(AppEvent::SeverinBridge(
-                    BridgeThreadEvent::RetryDrain(generation),
-                ));
-            });
+    fn schedule_drain_after(&mut self, delay: Duration) {
+        if self.closed || self.drain_polling_disabled {
+            return;
+        }
 
-        if let Err(error) = spawn_result {
-            self.drain_retry_pending = false;
+        self.drain_generation = self.drain_generation.wrapping_add(1);
+        self.drain_due = false;
+        let generation = self.drain_generation;
+        let Some(timer) = &self.drain_timer else {
             self.drain_polling_disabled = true;
             warn!(
-                "Severin bridge could not schedule a delayed outbound-drain retry;                  automatic drain polling is disabled for this document while the window remains open: {error}"
+                "Severin bridge drain timer is unavailable; automatic drain polling is disabled \
+                 while the window remains open"
+            );
+            return;
+        };
+        if timer
+            .send(DrainTimerCommand::Schedule { generation, delay })
+            .is_err()
+        {
+            self.drain_polling_disabled = true;
+            warn!(
+                "Severin bridge drain timer stopped unexpectedly; automatic drain polling is \
+                 disabled while the window remains open"
             );
         }
     }
+}
+
+fn spawn_drain_timer(rx: Receiver<DrainTimerCommand>, proxy: EventLoopProxy<AppEvent>) {
+    thread::Builder::new()
+        .name("severin-bridge-drain-timer".to_owned())
+        .spawn(move || {
+            let mut scheduled: Option<(u64, Instant)> = None;
+            loop {
+                if let Some((generation, deadline)) = scheduled {
+                    let wait = deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(wait) {
+                        Ok(DrainTimerCommand::Schedule { generation, delay }) => {
+                            scheduled = Some((generation, Instant::now() + delay));
+                        },
+                        Err(RecvTimeoutError::Timeout) => {
+                            scheduled = None;
+                            if proxy
+                                .send_event(AppEvent::SeverinBridge(BridgeThreadEvent::PollDrain(
+                                    generation,
+                                )))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        },
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                } else {
+                    match rx.recv() {
+                        Ok(DrainTimerCommand::Schedule { generation, delay }) => {
+                            scheduled = Some((generation, Instant::now() + delay));
+                        },
+                        Err(_) => return,
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn Severin bridge drain timer");
 }
 
 fn set_close_on_exec(fd: RawFd) {
@@ -837,7 +962,7 @@ const SEVERIN_BRIDGE_SHIM: &str = r#"
     for (const frame of drained) { outboundByteCount -= frame.jsonBytes; delete frame.jsonBytes; }
     const rejectionDelta = { tooLarge: rejectedTooLarge, backpressure: rejectedBackpressure };
     rejectedTooLarge = 0; rejectedBackpressure = 0;
-    return { documentId, frames: drained, rejectionDelta };
+    return { documentId, frames: drained, queuedRemaining: outbound.length, rejectionDelta };
   }, configurable: false, enumerable: false, writable: false });
   Object.defineProperty(globalThis, "__severinReject", { value(expectedDocumentId, callId, name) {
     if (expectedDocumentId !== documentId) { return false; }
