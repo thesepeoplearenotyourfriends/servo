@@ -69,6 +69,7 @@ impl App {
         let t = Instant::now();
         let bridge = servo_shell_preferences
             .severin_bridge_fds
+            .clone()
             .and_then(|config| {
                 event_loop
                     .event_loop_proxy()
