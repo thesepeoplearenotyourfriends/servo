@@ -438,7 +438,7 @@ fn validate_bridge_delay(name: &str, value: u64) -> Result<u64, String> {
     Ok(value)
 }
 
-fn parse_bridge_startup_retry_schedule(value: String) -> Result<Vec<u64>, String> {
+fn parse_bridge_startup_retry_schedule(value: String) -> Result<Option<Vec<u64>>, String> {
     let mut delays = Vec::new();
     for part in value.split(',') {
         let part = part.trim();
@@ -458,7 +458,7 @@ fn parse_bridge_startup_retry_schedule(value: String) -> Result<Vec<u64>, String
             "--bridge-startup-retry-ms must contain between 1 and {MAX_BRIDGE_STARTUP_RETRIES} delays"
         ));
     }
-    Ok(delays)
+    Ok(Some(delays))
 }
 
 fn bridge_timing_requested(cmd_args: &CmdArgs) -> bool {
