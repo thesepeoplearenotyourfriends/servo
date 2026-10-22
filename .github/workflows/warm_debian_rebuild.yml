@@ -252,6 +252,16 @@ jobs:
             -c "http.extraheader=AUTHORIZATION: basic $auth" \
             fetch --no-tags --depth=50 origin "$GITHUB_SHA"
 
+          # Cargo can rewrite the lockfile during a build, and the warm archive
+          # captures that generated change along with the source worktree.
+          # Discard only this cached lockfile drift before updating source;
+          # restoring the whole tree would destroy Cargo's timestamp warmth.
+          if ! git -C "$GITHUB_WORKSPACE" diff --quiet HEAD -- Cargo.lock; then
+            echo "Discarding cached Cargo.lock changes before source update."
+            git -C "$GITHUB_WORKSPACE" restore \
+              --source=HEAD --staged --worktree -- Cargo.lock
+          fi
+
           # When the dispatched commit is unchanged, Git leaves the existing
           # worktree files alone, preserving their timestamps. Changed source
           # files are the only ones rewritten.
