@@ -245,6 +245,14 @@ impl DocumentEventHandler {
     /// Note a pending input event, to be processed at the next `update_the_rendering` task.
     pub(crate) fn note_pending_input_event(&self, event: ConstellationInputEvent) {
         let mut pending_input_events = self.pending_input_events.borrow_mut();
+        // A move after a button transition must not replace a move before it. In
+        // particular, a one-frame drag must remain ordered down -> move -> up.
+        if matches!(
+            event.event.event,
+            InputEvent::MouseButton(..) | InputEvent::MouseLeftViewport(..)
+        ) {
+            *self.mouse_move_event_index.borrow_mut() = None;
+        }
         if matches!(event.event.event, InputEvent::MouseMove(..)) {
             // First try to replace any existing mouse move event.
             if let Some(mouse_move_event) = self
