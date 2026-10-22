@@ -274,8 +274,10 @@ impl<'dom> LayoutDom<'dom, Node> {
 
         // Text nodes are always the same node when projected into the flat tree, so
         // it is fine to do the following check against the original unprojected nodes.
-        let is_start_node = unsafe { range_start.node().to_layout() } == *self;
-        let is_end_node = unsafe { range_end.node().to_layout() } == *self;
+        let start_node: LayoutDom<'dom, Node> = unsafe { range_start.node().to_layout() };
+        let end_node: LayoutDom<'dom, Node> = unsafe { range_end.node().to_layout() };
+        let is_start_node = start_node == *self;
+        let is_end_node = end_node == *self;
 
         let start_offset = if is_start_node {
             utf16_offset_to_utf32_offset(text, range_start.offset().into())

@@ -44,10 +44,13 @@ cargo test --locked -p servo-url --test local_runtime_raw_url
 
 `offset_map.rs` is independent of layout/style and contains five tests. It can be compiled directly with `rustc --test` against the artifacts from `cargo build --locked -p servo-base`, supplying the `servo_base`, `malloc_size_of` (the `servo_malloc_size_of` artifact), and `malloc_size_of_derive` externs plus the target's debug dependency directory. This runs the production mapping module without compiling `servo-script`.
 
+The embedder regression `components/servo/tests/document_selection.rs` queues a native drag in one frame, checks DOM selection before/after release, captures the trusted Copy message through a clipboard delegate, and verifies that focused text-control copy retains priority. It does not test a physical OS clipboard.
+
 On the established warm GitHub build infrastructure, run:
 
 ```sh
 cargo test --locked -p servo-layout --lib offset_map
+cargo test --locked -p servo --test document_selection -- --test-threads=1
 ./mach build --debug
 ./mach test-wpt --debug /_mozilla/input-events/mouse-document-selection.html
 ./mach test-wpt --debug /_mozilla/input-events/document-selection-paint.html

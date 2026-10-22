@@ -245,6 +245,14 @@ impl DocumentEventHandler {
     /// Note a pending input event, to be processed at the next `update_the_rendering` task.
     pub(crate) fn note_pending_input_event(&self, event: ConstellationInputEvent) {
         let mut pending_input_events = self.pending_input_events.borrow_mut();
+        // A move after a button transition must not replace a move before it. In
+        // particular, a one-frame drag must remain ordered down -> move -> up.
+        if matches!(
+            event.event.event,
+            InputEvent::MouseButton(..) | InputEvent::MouseLeftViewport(..)
+        ) {
+            *self.mouse_move_event_index.borrow_mut() = None;
+        }
         if matches!(event.event.event, InputEvent::MouseMove(..)) {
             // First try to replace any existing mouse move event.
             if let Some(mouse_move_event) = self
@@ -1275,14 +1283,6 @@ impl DocumentEventHandler {
         event: EmbedderTouchEvent,
         input_event: &ConstellationInputEvent,
     ) -> InputEventResult {
-        if event.button == MouseButton::Left {
-            if event.action == MouseButtonAction::Up {
-                self.document_selection_drag_active.set(false);
-            } else {
-                self.document_selection_drag_active.set(false);
-                self.document_selection_drag_changed.set(false);
-            }
-        }
         // Ignore all incoming events without a hit test.
         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
             self.update_active_touch_points_when_early_return(event);
@@ -1677,14 +1677,6 @@ impl DocumentEventHandler {
         event: EmbedderWheelEvent,
         input_event: &ConstellationInputEvent,
     ) -> InputEventResult {
-        if event.button == MouseButton::Left {
-            if event.action == MouseButtonAction::Up {
-                self.document_selection_drag_active.set(false);
-            } else {
-                self.document_selection_drag_active.set(false);
-                self.document_selection_drag_changed.set(false);
-            }
-        }
         // Ignore all incoming events without a hit test.
         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
             return Default::default();

@@ -1127,3 +1127,8 @@ The pending source work is therefore:
 - Opened draft PR #52 and dispatched warm validation for its exact initial commit (`7b2051cc52848732800bd6a33da4bd74837fc583`). Run `39849428041` failed before compilation in the restored-source update step.
 - The log-download host was denied by the cloud proxy. A diagnostic copy of the existing workflow on `codex/native-document-selection-validation` reported stderr through check annotations; run `39850910311` confirmed the warm snapshot's dirty `Cargo.lock` prevented the fast-forward merge. This was an infrastructure failure, not a compiler result.
 - Corrected `warm_command.yml` to preserve the snapshot lockfile in `$RUNNER_TEMP/warm-snapshot-Cargo.lock` and restore only that tracked file before source synchronization. This applies to the fresh, disposable CI snapshot checkout; local development checkouts are not reset. It retains other warm files, dependency caches, and timestamps.
+
+### Batched native input and clipboard regression
+
+- Preserved mouse-move ordering across mouse-button and viewport-exit events. Previously a later move could replace an earlier pending move across mousedown, leaving a drag queued within one rendering tick collapsed.
+- Added `components/servo/tests/document_selection.rs`: native down/move/up against ordinary paragraph text, DOM stringification while pressed and after release, the trusted Copy action observed through a clipboard delegate, and text-control copy priority. The test uses the existing software-rendering embedder harness and bounded waits for its new checks. Execution remains pending warm validation; this is not a physical system clipboard test.
