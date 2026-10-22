@@ -1,4 +1,4 @@
-name: Warm Debian 12 Command
+name: Native Selection Warm Validation
 
 on:
   workflow_dispatch:
@@ -187,11 +187,28 @@ jobs:
           persist-credentials: false
 
       - name: Update restored source in place
+        id: source_update
         if: steps.warm_state.outputs.has_repo_worktree == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
+
+          sync_log="${RUNNER_TEMP}/selection-source-sync.stderr"
+          exec 2> >(tee "$sync_log" >&2)
+          report_source_sync_error() {
+            sync_status=$?
+            while IFS= read -r error_line; do
+              if [[ -n "${GH_TOKEN:-}" && "$error_line" == *"$GH_TOKEN"* ]]; then
+                error_line="[credential-containing error line redacted]"
+              fi
+              error_line="${error_line//%/%25}"
+              printf '::error::Warm source update: %s\n' "$error_line"
+            done < <(tail -n 20 "$sync_log")
+            exit "$sync_status"
+          }
+          trap report_source_sync_error ERR
+
 
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
