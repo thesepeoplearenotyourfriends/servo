@@ -1,5 +1,13 @@
 # Local Runtime Progress
 
+## 2026-10-22 — Selection integration compilation correction
+
+- Read the attached warm release compiler receipt and inspected inline construction, text-run original ranges, fragment merging, query reverse mapping, and upstream display-contents/control mapping. Confirmed the 11 errors are missing builder stack methods, an unimported UTF-32 type, the wrong pointer-identity primitive, and three query zero constructors.
+- Repaired only selection/layout integration: restored real `display: contents` style-stack push/pop behavior, imported `Utf32CodeUnits`, used the existing `ArcRefCell::ptr_eq`, and replaced the three query `Au::zero()` calls with `Au::new(0)`.
+- Corrected control insertion to map `(new_characters, new_characters)`. Original IFC coordinates include controls; node-local DOM offsets are derived from each text run's recorded original range. Added a builder regression for neighboring endpoints around bidi controls/object replacements, collapsed whitespace, case expansion, and Unicode scalar counts.
+- Validation: 10 standalone tests passed; substituting the old zero-original-length mapping fails the new regression. Harness uses production Unicode/map/cell code plus the actual builder method/test projected onto relevant fields, omitting heap-accounting derives. Locked metadata resolves layout/script. Combined release type-check attempted offline but blocked before compilation by uncached `accesskit v0.24.0`; shell proxy is unreachable and GitHub CLI authentication unavailable. No new compiler errors established; warm joint type-check/test commands are recorded in `native-document-selection.md`.
+- No Servo script implementation, Python bridge, egui, file opening, or resource policy changed. NO CARRIER invariants preserved; no resource paths, permissions, or transport allowances added.
+
 ## 2026-10-22 — Warm Debian build lockfile recovery
 
 - Investigated the warm worktree update failure from `731391d91` to `0abc05422`: Git refused the fast-forward because the restored snapshot contained local changes to `Cargo.lock`.

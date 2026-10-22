@@ -8,7 +8,9 @@ use std::ops::Range;
 
 use icu_properties::BidiClass;
 use layout_api::{LayoutNode, SharedSelection};
-use servo_base::text::{Utf8CodeUnitLength, Utf32CodeUnitLength, utf8_offset_to_utf32_offset};
+use servo_base::text::{
+    Utf8CodeUnitLength, Utf32CodeUnitLength, Utf32CodeUnits, utf8_offset_to_utf32_offset,
+};
 use style::computed_values::direction::T as Direction;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::dom::NodeInfo;
@@ -154,7 +156,10 @@ impl InlineFormattingContextBuilder {
         self.current_character_offset += new_characters.0;
         self.offset_map
             .borrow_mut()
-            .push_range(Utf32CodeUnits(0), new_characters);
+            // Synthetic controls occupy both sides of the shared IFC coordinate
+            // space. Each text run records its original range within that space,
+            // rather than within a concatenation of DOM text-node offsets.
+            .push_range(new_characters, new_characters);
     }
 
     fn shared_inline_styles(&self) -> SharedInlineStyles {
@@ -500,6 +505,14 @@ impl InlineFormattingContextBuilder {
         }
     }
 
+    pub(crate) fn enter_display_contents(&mut self, shared_inline_styles: SharedInlineStyles) {
+        self.shared_inline_styles_stack.push(shared_inline_styles);
+    }
+
+    pub(crate) fn leave_display_contents(&mut self) {
+        self.shared_inline_styles_stack.pop();
+    }
+
     /// Finish the current inline formatting context, returning [`None`] if the context was empty.
     pub(crate) fn finish(
         self,
@@ -606,6 +619,52 @@ fn first_letter_range(text: &str) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_characters_preserve_neighboring_selection_boundaries() {
+        // An inline object and nested bidi controls between two DOM text runs.
+        // The controls count as Unicode scalars, not UTF-8 bytes.
+        for controls in ["", "\u{fffc}", "\u{2067}\u{202e}", "\u{202c}\u{2069}"] {
+            let mut builder = InlineFormattingContextBuilder::default();
+            builder
+                .offset_map
+                .borrow_mut()
+                .push_range(Utf32CodeUnits(2), Utf32CodeUnits(2));
+            builder.current_text_offset = "a🦊".len();
+            builder.current_character_offset = 2;
+            let previous_end = Utf32CodeUnits(2);
+
+            builder.push_control_character_string(controls);
+
+            let following_start = builder.offset_map.borrow().total_original_size();
+            assert_eq!(following_start.0, 2 + controls.chars().count());
+            assert_eq!(builder.current_character_offset, following_start.0);
+            assert_eq!(builder.current_text_offset, "a🦊".len() + controls.len());
+            assert_eq!(builder.text_segments.concat(), controls);
+
+            // The following node starts with collapsed whitespace, then expands
+            // a case mapping (ß -> SS), then contains a non-BMP scalar.
+            let mut map = builder.offset_map.borrow_mut();
+            map.push_range(Utf32CodeUnits(2), Utf32CodeUnits(0));
+            map.push_range(Utf32CodeUnits(1), Utf32CodeUnits(2));
+            map.push_range(Utf32CodeUnits(1), Utf32CodeUnits(1));
+            assert_eq!(map.map(previous_end), previous_end);
+            assert_eq!(
+                map.reverse_map_in_range(previous_end, Utf32CodeUnits(0)..previous_end),
+                previous_end
+            );
+            let following_range = following_start..following_start + Utf32CodeUnits(4);
+            for (local_dom, local_glyph) in [(2, 0), (3, 2), (4, 3)] {
+                let original = following_start + Utf32CodeUnits(local_dom);
+                let glyph = following_start + Utf32CodeUnits(local_glyph);
+                assert_eq!(map.map(original), glyph);
+                assert_eq!(
+                    map.reverse_map_in_range(glyph, following_range.clone()),
+                    Utf32CodeUnits(local_dom)
+                );
+            }
+        }
+    }
 
     fn assert_first_letter_eq(text: &str, expected: &str) {
         let range = first_letter_range(text);
