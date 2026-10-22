@@ -1,5 +1,13 @@
 # Local Runtime Progress
 
+## 2026-10-22 — Warm Debian build lockfile recovery
+
+- Investigated the warm worktree update failure from `731391d91` to `0abc05422`: Git refused the fast-forward because the restored snapshot contained local changes to `Cargo.lock`.
+- Updated `.github/workflows/warm_debian_rebuild.yml` to detect lockfile drift against the snapshot's `HEAD` and restore only `Cargo.lock` in the index and worktree before source update, including when the requested commit is unchanged. A clean lockfile is left untouched so its timestamp survives.
+- Kept fast-forward-only updates and preserved unrelated source timestamps, Cargo target artifacts, and repo-local warm state. Other source modifications still receive Git's normal merge protection.
+- Validation: isolated Git fixtures exercise dirty and staged lockfiles, unchanged requested commits, clean lockfile timestamps, and unchanged source timestamps. The full Debian build remains deferred to GitHub Actions.
+- No Servo crates, runtime resource paths, or resource authorization behavior changed.
+
 
 ## 2026-06-18 — Manual build smoke de-duplication
 
