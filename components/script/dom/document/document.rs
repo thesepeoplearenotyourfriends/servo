@@ -118,7 +118,7 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{
-    Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout, ToLayoutOptional, UnrootedDom,
+    Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout, UnrootedDom,
 };
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::trace::{HashMapTracedValues, NoTrace};
@@ -3456,7 +3456,7 @@ pub(crate) enum DocumentSource {
 impl<'dom> LayoutDom<'dom, Document> {
     #[expect(unsafe_code)]
     pub(crate) fn selection_for_layout(&self) -> Option<LayoutDom<'dom, Selection>> {
-        unsafe { self.unsafe_get().selection.to_layout() }
+        unsafe { self.unsafe_get().selection.get_inner_as_layout() }
     }
 
     #[inline]
