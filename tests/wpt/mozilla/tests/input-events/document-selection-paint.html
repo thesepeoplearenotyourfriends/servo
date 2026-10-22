@@ -1,0 +1,30 @@
+<!doctype html>
+<html class="reftest-wait">
+<meta charset="utf-8">
+<title>Document selection highlights follow wrapped line boxes after range changes</title>
+<link rel="match" href="document-selection-paint-ref.html">
+<link rel="stylesheet" href="/fonts/ahem.css">
+<style>
+  body { margin: 0; }
+  p { margin: 0; width: 7ch; font: 20px/24px Ahem; }
+  ::selection { background: rgb(176, 214, 255); }
+</style>
+<p id="text">abc def ghi jkl</p>
+<script>
+document.fonts.ready.then(() => {
+  const selection = getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(text);
+  selection.addRange(range);
+  requestAnimationFrame(() => {
+    // Exercise removal of the old highlight as well as new boundary offsets.
+    selection.removeAllRanges();
+    const next = document.createRange();
+    next.setStart(text.firstChild, 1);
+    next.setEnd(text.firstChild, 11);
+    selection.addRange(next);
+    requestAnimationFrame(() => document.documentElement.classList.remove('reftest-wait'));
+  });
+});
+</script>
+</html>

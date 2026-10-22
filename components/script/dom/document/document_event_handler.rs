@@ -51,6 +51,7 @@ use webrender_api::ExternalScrollId;
 
 #[cfg(feature = "gamepad")]
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::PermissionName;
+use crate::dom::bindings::codegen::Bindings::SelectionBinding::SelectionMethods;
 use crate::dom::bindings::inheritance::{ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::root::MutNullableDom;
@@ -200,6 +201,9 @@ pub(crate) struct DocumentEventHandler {
     next_touch_pointer_id: Cell<i32>,
     /// A map holding information about currently registered access key handlers.
     access_key_handlers: DomRefCell<FxHashMap<NoTrace<Code>, Dom<HTMLElement>>>,
+    /// Native document selection drag, independent of editable form control gestures.
+    document_selection_drag_active: Cell<bool>,
+    document_selection_drag_changed: Cell<bool>,
     /// Map from pointer ID to pending pointer capture target override element.
     /// This is set by setPointerCapture and cleared by releasePointerCapture.
     /// <https://w3c.github.io/pointerevents/#pointer-capture>
@@ -231,6 +235,8 @@ impl DocumentEventHandler {
             active_pointer_ids: Default::default(),
             next_touch_pointer_id: Cell::new(1),
             access_key_handlers: Default::default(),
+            document_selection_drag_active: Cell::new(false),
+            document_selection_drag_changed: Cell::new(false),
             pending_pointer_capture: Default::default(),
             pointer_capture_target: Default::default(),
         }
@@ -239,6 +245,14 @@ impl DocumentEventHandler {
     /// Note a pending input event, to be processed at the next `update_the_rendering` task.
     pub(crate) fn note_pending_input_event(&self, event: ConstellationInputEvent) {
         let mut pending_input_events = self.pending_input_events.borrow_mut();
+        // A move after a button transition must not replace a move before it. In
+        // particular, a one-frame drag must remain ordered down -> move -> up.
+        if matches!(
+            event.event.event,
+            InputEvent::MouseButton(..) | InputEvent::MouseLeftViewport(..)
+        ) {
+            *self.mouse_move_event_index.borrow_mut() = None;
+        }
         if matches!(event.event.event, InputEvent::MouseMove(..)) {
             // First try to replace any existing mouse move event.
             if let Some(mouse_move_event) = self
@@ -589,6 +603,23 @@ impl DocumentEventHandler {
             return;
         };
 
+        if self.document_selection_drag_active.get() {
+            if input_event.pressed_mouse_buttons & 1 == 0 {
+                self.document_selection_drag_active.set(false);
+                self.document_selection_drag_changed.set(false);
+            } else if let Some((container, offset)) = self
+                .window
+                .document_text_position_query(&hit_test_result.node, hit_test_result.point_in_frame)
+                && container.document_text_selection_allowed()
+                && let Some(selection) = self.window.Document().selection()
+            {
+                selection.collapse_or_extend_to_dom_position(cx, &container, offset);
+                if !selection.IsCollapsed() {
+                    self.document_selection_drag_changed.set(true);
+                }
+            }
+        }
+
         let old_mouse_move_point = self
             .most_recent_mousemove_point
             .replace(Some(hit_test_result.point_in_frame));
@@ -860,6 +891,14 @@ impl DocumentEventHandler {
         event: MouseButtonEvent,
         input_event: &ConstellationInputEvent,
     ) {
+        if event.button == MouseButton::Left {
+            if event.action == MouseButtonAction::Up {
+                self.document_selection_drag_active.set(false);
+            } else {
+                self.document_selection_drag_active.set(false);
+                self.document_selection_drag_changed.set(false);
+            }
+        }
         // Ignore all incoming events without a hit test.
         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
             return;
@@ -977,7 +1016,8 @@ impl DocumentEventHandler {
                 // Increment button count before firing so setPointerCapture works in handler.
                 self.mouse_buttons_down.set(mouse_buttons_down + 1);
 
-                pointer_event.upcast::<Event>().fire(cx, &pointer_target);
+                let pointer_down_allowed =
+                    pointer_event.upcast::<Event>().fire(cx, &pointer_target);
 
                 // Process pending pointer capture after firing event, but skip if we just
                 // released a disconnected capture to avoid immediately re-capturing.
@@ -990,6 +1030,23 @@ impl DocumentEventHandler {
                 let result = mouse_event
                     .upcast::<Event>()
                     .dispatch(cx, node.upcast(), false);
+
+                // Upstream #47358: selection is a default action of an uncanceled primary down.
+                if result
+                    && pointer_down_allowed
+                    && event.button == MouseButton::Left
+                    && node.document_text_selection_allowed()
+                    && let Some((container, offset)) = self.window.document_text_position_query(
+                        &hit_test_result.node,
+                        hit_test_result.point_in_frame,
+                    )
+                    && container.document_text_selection_allowed()
+                    && let Some(selection) = document.GetSelection(cx)
+                {
+                    selection.collapse_to_dom_position(cx, &container, offset);
+                    self.document_selection_drag_active.set(true);
+                    debug!("[local-runtime document-selection] begin");
+                }
 
                 // Step 8. If result is true and target is a focusable area
                 // that is click focusable, then Run the focusing steps at target.
@@ -1072,6 +1129,10 @@ impl DocumentEventHandler {
                     .borrow_mut()
                     .increment_click_count(event.button, hit_test_result.point_in_frame);
 
+                if self.document_selection_drag_changed.replace(false) {
+                    self.last_mouse_button_down_point.set(None);
+                    return;
+                }
                 self.maybe_trigger_click_for_mouse_button_down_event(
                     cx,
                     event,
@@ -1931,6 +1992,38 @@ impl DocumentEventHandler {
         let event = clipboard_event.upcast::<Event>();
         if !event.IsTrusted() {
             return event.flags().into();
+        }
+
+        // #48101's document copy default action, kept separate from later context-menu work.
+        // Editable controls retain their existing copy/cut/paste handling and canceled copy events
+        // retain their DataTransfer override below.
+        if matches!(action, EditingActionEvent::Copy)
+            && !event.DefaultPrevented()
+            && !event.flags().contains(EventFlags::Handled)
+            && event
+                .GetTarget()
+                .and_then(DomRoot::downcast::<Node>)
+                .is_some_and(|node| {
+                    !node.is_editable_or_editing_host()
+                        && !node
+                            .inclusive_ancestors(ShadowIncluding::Yes)
+                            .filter_map(DomRoot::downcast::<Element>)
+                            .any(|element| {
+                                matches!(
+                                    element.local_name().as_ref(),
+                                    "input" | "textarea" | "select"
+                                )
+                            })
+                })
+            && let Some(selection) = self.window.Document().selection()
+            && !selection.IsCollapsed()
+        {
+            self.window.send_to_embedder(EmbedderMsg::SetClipboardText(
+                self.window.webview_id(),
+                selection.Stringifier().to_string(),
+            ));
+            event.mark_as_handled();
+            debug!("[local-runtime document-selection] copy");
         }
 
         // Step 4 If the event was canceled, then

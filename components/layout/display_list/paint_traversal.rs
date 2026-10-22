@@ -142,7 +142,19 @@ impl<'a, Handler: PaintTraversalHandler> PaintTraversal<'a, Handler> {
             // >  ↪ If root is an inline-level box
             // >     For each line box root is in, paint a box in a line box given root, the
             // >     line box, and canvas.
-            self.traverse_box_in_a_line_box(state, root, true /* at_stacking_context_root */);
+
+            // TODO(mrobinson): This is not actually the real line box, but the content rectangle
+            // of the inline box. The real line box is hard to access when an inline box starts
+            // a stacking container, so we fall back gracefully to this (perhaps smaller) rectangle.
+            // To fix this, we'd need to put the containing line box rectangle on the `StackingContext`
+            // data structure or onto the `TextFragment` itself somehow.
+            let line_box_rect = PhysicalRect::new(inner_state.origin, root.content_rect().size);
+            self.traverse_box_in_a_line_box(
+                state,
+                root,
+                line_box_rect,
+                true, /* at_stacking_context_root */
+            );
         } else if saw_inline_level_or_replaced {
             // >  ↪ Otherwise
             // >    First for root, then for all its in-flow, non-positioned, block-level
@@ -330,8 +342,10 @@ impl<'a, Handler: PaintTraversalHandler> PaintTraversal<'a, Handler> {
             },
             Fragment::Positioning(positioning_fragment) if positioning_fragment.is_line_box() => {
                 let state = state.push_positioning_fragment(positioning_fragment);
+                let line_box_rect =
+                    PhysicalRect::new(state.origin, positioning_fragment.base.rect().size);
                 for child in &positioning_fragment.children {
-                    self.traverse_fragment_in_a_line_box(&state, child);
+                    self.traverse_fragment_in_a_line_box(&state, child, line_box_rect);
                 }
             },
             Fragment::Positioning(positioning_fragment) => {
@@ -352,23 +366,26 @@ impl<'a, Handler: PaintTraversalHandler> PaintTraversal<'a, Handler> {
         }
     }
 
-    fn traverse_fragment_in_a_line_box(&mut self, state: &TraversalState, fragment: &Fragment) {
+    fn traverse_fragment_in_a_line_box(
+        &mut self,
+        state: &TraversalState,
+        fragment: &Fragment,
+        line_box_rect: PhysicalRect<Au>,
+    ) {
         match fragment {
-            Fragment::LayoutRoot(layout_root_fragment) => {
-                self.traverse_fragment_in_a_line_box(state, &layout_root_fragment.inner())
-            },
+            Fragment::LayoutRoot(layout_root_fragment) => self.traverse_fragment_in_a_line_box(
+                state,
+                &layout_root_fragment.inner(),
+                line_box_rect,
+            ),
             Fragment::Box(box_fragment) => self.traverse_box_in_a_line_box(
                 state,
                 box_fragment,
+                line_box_rect,
                 false, /* at_stacking_context_root */
             ),
             Fragment::Text(text_fragment) => {
-                // This containing block is wrong and should use the size from the parent
-                // positioning context.
-                let containing_block =
-                    PhysicalRect::new(state.origin, text_fragment.base.rect().size);
-                self.handler
-                    .visit_text(state, containing_block, text_fragment);
+                self.handler.visit_text(state, line_box_rect, text_fragment);
             },
             Fragment::AbsoluteOrFixedPositionedPlaceholder(..) | Fragment::Float(..) => {},
             Fragment::Positioning(..) => {
@@ -385,6 +402,7 @@ impl<'a, Handler: PaintTraversalHandler> PaintTraversal<'a, Handler> {
         &mut self,
         state: &TraversalState,
         box_fragment: &Arc<BoxFragment>,
+        line_box_rect: PhysicalRect<Au>,
         at_stacking_context_root: bool,
     ) {
         // If this box establishes a stacking context or stacking container, do not paint
@@ -430,7 +448,7 @@ impl<'a, Handler: PaintTraversalHandler> PaintTraversal<'a, Handler> {
         } else {
             let state = state.push_box_fragment(box_fragment);
             for child in &box_fragment.children {
-                self.traverse_fragment_in_a_line_box(&state, child);
+                self.traverse_fragment_in_a_line_box(&state, child, line_box_rect);
             }
         }
     }
@@ -503,7 +521,7 @@ pub(crate) trait PaintTraversalHandler {
     fn visit_text(
         &mut self,
         state: &TraversalState,
-        containing_block: PhysicalRect<Au>,
+        line_box_rect: PhysicalRect<Au>,
         fragment: &Arc<TextFragment>,
     );
     fn visit_positioning(&mut self, _state: &TraversalState, _fragment: &Arc<PositioningFragment>) {
@@ -541,10 +559,11 @@ impl TraversalState {
         //
         // Also do not propagate text decorations to floats or replaced content.
         let mut propagated_text_decorations = self.text_decorations.clone();
-        if box_fragment.is_atomic_inline_level() ||
-            box_fragment.base.flags.contains(
-                FragmentFlags::IS_OUTSIDE_LIST_ITEM_MARKER | FragmentFlags::IS_REPLACED,
-            )
+        if box_fragment.is_atomic_inline_level()
+            || box_fragment
+                .base
+                .flags
+                .contains(FragmentFlags::IS_OUTSIDE_LIST_ITEM_MARKER | FragmentFlags::IS_REPLACED)
         {
             propagated_text_decorations = Default::default();
         }

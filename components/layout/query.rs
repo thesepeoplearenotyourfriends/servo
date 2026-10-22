@@ -43,13 +43,12 @@ use style::values::generics::font::LineHeight;
 use style::values::generics::position::AspectRatio;
 use style::values::specified::GenericGridTemplateComponent;
 use style::values::specified::box_::DisplayInside;
-use style::values::specified::text::TextTransformCase;
 use style_traits::{CSSPixel, ParsingMode, ToCss};
 
 use crate::cell::RefOrAtomicRef;
 use crate::display_list::{StackingContextTree, au_rect_to_length_rect};
 use crate::dom::NodeExt;
-use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse, capitalize_string};
+use crate::flow::inline::text_transform::TextTransformationIterator;
 use crate::fragment_tree::{
     BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo, TextFragment,
 };
@@ -1113,16 +1112,15 @@ fn rendered_text_collection_steps(
                     display,
                     Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
                 );
+
                 // Now we need to decide on whether to remove beginning white space or not, this
                 // is mainly decided by the elements we rendered before, but may be overwritten by the white-space
                 // property.
-                let trim_beginning_white_space =
+                let trim_leading_white_space =
                     !preserve_whitespace && (state.may_start_with_whitespace || is_inline);
-                let with_white_space_rules_applied = WhitespaceCollapse::new(
-                    text_content.chars(),
-                    white_space_collapse,
-                    trim_beginning_white_space,
-                );
+                // FIXME: This assumes the element always start at a word boundary. But can fail:
+                // a<span style="text-transform: capitalize">b</span>c
+                let on_word_boundary = true;
 
                 // Step 4: If node is a Text node, then for each CSS text box produced by node, in
                 // content order, compute the text of the box after application of the CSS
@@ -1131,16 +1129,14 @@ fn rendered_text_collection_steps(
                 // rules are slightly modified: collapsible spaces at the end of lines are always
                 // collapsed, but they are only removed if the line is the last line of the block,
                 // or it ends with a br element. Soft hyphens should be preserved.
-                let text_transform = style.clone_text_transform().case();
-                let mut transformed_text: String =
-                    TextTransformation::new(with_white_space_rules_applied, text_transform)
-                        .collect();
-
-                // Since iterator for capitalize not doing anything, we must handle it outside here
-                // FIXME: This assumes the element always start at a word boundary. But can fail:
-                // a<span style="text-transform: capitalize">b</span>c
-                if TextTransformCase::Capitalize == text_transform {
-                    transformed_text = capitalize_string(&transformed_text, true);
+                let mut transformed_text = String::with_capacity(text_content.len());
+                for iteration in TextTransformationIterator::new(
+                    &text_content,
+                    style,
+                    trim_leading_white_space,
+                    on_word_boundary,
+                ) {
+                    transformed_text.extend(iteration.characters());
                 }
 
                 let is_preformatted_element =
@@ -1454,6 +1450,123 @@ pub fn find_character_offset_in_fragment_descendants(
         closest_fragment
             .fragment
             .character_offset(closest_fragment.point_in_fragment)
+    })
+}
+
+#[expect(unsafe_code)]
+pub fn find_document_text_position(
+    node: &ServoLayoutNode,
+    stacking_context_tree: &StackingContextTree,
+    point_in_viewport: Point2D<Au, CSSPixel>,
+) -> Option<(UntrustedNodeAddress, usize)> {
+    fn maybe_update_closest(
+        fragment: &Fragment,
+        point_in_fragment: Point2D<Au, CSSPixel>,
+        closest_relative_fragment: &mut Option<ClosestFragment>,
+    ) {
+        let Fragment::Text(text_fragment) = fragment else {
+            return;
+        };
+
+        let Some(tag) = text_fragment.base.tag.as_ref() else {
+            return;
+        };
+        // Generated content and editing widgets do not supply document range endpoints.
+        if !tag.pseudo_element_chain.is_empty()
+            || text_fragment
+                .offsets
+                .as_ref()
+                .is_none_or(|offsets| offsets.dom_mapping.is_none())
+            || text_fragment.base.style().clone_user_select()
+                == style::values::computed::UserSelect::None
+            || text_fragment.base.style().clone_visibility() != Visibility::Visible
+        {
+            return;
+        }
+        // Recursion has translated the point to the text fragment's content origin.
+        // Compare against local bounds, not its parent's positioned rectangle.
+        let size = text_fragment.base.rect().size;
+        let point_in_vertical_bounds =
+            point_in_fragment.y >= Au::zero() && point_in_fragment.y <= size.height;
+        let dx = (-point_in_fragment.x)
+            .max(Au::zero())
+            .max(point_in_fragment.x - size.width);
+        let dy = (-point_in_fragment.y)
+            .max(Au::zero())
+            .max(point_in_fragment.y - size.height);
+        let distance = Au::from_f64_px(dx.to_f64_px().hypot(dy.to_f64_px()));
+
+        if closest_relative_fragment
+            .as_ref()
+            .is_none_or(|closest_fragment| {
+                closest_fragment.should_replace(distance, point_in_vertical_bounds)
+            })
+        {
+            *closest_relative_fragment = Some(ClosestFragment {
+                fragment: text_fragment.clone(),
+                point_in_fragment,
+                distance,
+                point_in_vertical_bounds,
+            });
+        }
+    }
+
+    fn collect_relevant_children(
+        fragment: &Fragment,
+        point_in_viewport: Point2D<Au, CSSPixel>,
+        closest_relative_fragment: &mut Option<ClosestFragment>,
+    ) {
+        maybe_update_closest(fragment, point_in_viewport, closest_relative_fragment);
+
+        if let Some(children) = fragment.children() {
+            for child in children.iter() {
+                let offset = child
+                    .base()
+                    .map(|base| base.rect().origin)
+                    .unwrap_or_default();
+                let point = point_in_viewport - offset.to_vector();
+                collect_relevant_children(child, point, closest_relative_fragment);
+            }
+        }
+    }
+
+    let mut closest_relative_fragment = None;
+    let mut root = *node;
+    loop {
+        for fragment in &root.fragments_for_pseudo(None) {
+            if let Some(point_in_fragment) =
+                stacking_context_tree.offset_in_fragment(fragment, point_in_viewport)
+            {
+                collect_relevant_children(
+                    fragment,
+                    point_in_fragment,
+                    &mut closest_relative_fragment,
+                );
+            }
+        }
+        if closest_relative_fragment.is_some() {
+            break;
+        }
+        // Text hit-test targets have no box/spatial node of their own in this baseline.
+        // Start the upstream closest-fragment search at the first usable containing box.
+        let Some(parent) = (unsafe { root.dangerous_flat_tree_parent() }) else {
+            break;
+        };
+        root = parent;
+    }
+
+    closest_relative_fragment.and_then(|closest_fragment| {
+        let fragment = &closest_fragment.fragment;
+        let offsets = fragment.offsets.as_ref()?;
+        let (map, original_range) = offsets.dom_mapping.as_ref()?;
+        let position = fragment
+            .character_offset(closest_fragment.point_in_fragment)
+            .unwrap_or(offsets.character_range.end);
+        let original = map.borrow().reverse_map_in_range(
+            servo_base::text::Utf32CodeUnits(position),
+            original_range.clone(),
+        );
+        Some((fragment.base.tag.as_ref()?.node.into(), original.0))
     })
 }
 

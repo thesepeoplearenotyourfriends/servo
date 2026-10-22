@@ -209,6 +209,14 @@ jobs:
             -c "http.extraheader=AUTHORIZATION: basic $auth" \
             fetch --no-tags --depth=50 origin "$GITHUB_SHA"
 
+          # This is a fresh CI workspace restored from the warm snapshot. Preserve a
+          # dirty snapshot lockfile before applying the requested commit's lockfile.
+          # Other warmed files and dependency caches retain their timestamps/state.
+          if ! git -C "$GITHUB_WORKSPACE" diff --quiet HEAD -- Cargo.lock; then
+            cp -p "$GITHUB_WORKSPACE/Cargo.lock" "$RUNNER_TEMP/warm-snapshot-Cargo.lock"
+            git -C "$GITHUB_WORKSPACE" restore --source=HEAD --staged --worktree -- Cargo.lock
+          fi
+
           current_sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
 
           if [ "$current_sha" = "$GITHUB_SHA" ]; then

@@ -615,6 +615,18 @@ impl Layout for LayoutThread {
     }
 
     #[servo_tracing::instrument(skip_all)]
+    fn query_document_text_position(
+        &self,
+        node: TrustedNodeAddress,
+        point: Point2D<Au, CSSPixel>,
+    ) -> Option<(UntrustedNodeAddress, usize)> {
+        with_layout_state(|| {
+            let node = unsafe { ServoLayoutNode::new(&node) };
+            let tree = self.stacking_context_tree.borrow();
+            crate::query::find_document_text_position(&node, tree.as_ref()?, point)
+        })
+    }
+
     fn query_effective_overflow(&self, node: TrustedNodeAddress) -> Option<AxesOverflow> {
         with_layout_state(|| {
             let node = unsafe { ServoLayoutNode::new(&node) };

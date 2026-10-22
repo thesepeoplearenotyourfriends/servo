@@ -860,6 +860,12 @@ pub(crate) struct TextRunOffsets {
     /// The range of characters this [`TextRun`] represents within the entire text of its
     /// inline formatting context.
     pub character_range: Range<usize>,
+    /// The IFC offset map and this DOM text node's starting offset before transformation.
+    #[ignore_malloc_size_of = "Shared with the inline formatting context"]
+    pub dom_mapping: Option<(
+        ArcRefCell<super::text_transform::OffsetMap>,
+        Range<servo_base::text::Utf32CodeUnits>,
+    )>,
 }
 
 pub(super) struct TextRunLineItem {
@@ -924,6 +930,14 @@ impl TextRunLineItem {
             .position(|glyph| !glyph.is_whitespace())
             .unwrap_or(self.text.len());
 
+        // Keep the fragment's transformed character start synchronized with trimmed glyphs.
+        let trimmed_characters: usize = self.text[..index_of_first_non_whitespace]
+            .iter()
+            .map(|glyphs| glyphs.character_count())
+            .sum();
+        if let Some(offsets) = self.offsets.as_mut() {
+            offsets.character_range.start += trimmed_characters;
+        }
         *whitespace_trimmed += self
             .text
             .drain(0..index_of_first_non_whitespace)
@@ -946,6 +960,18 @@ impl TextRunLineItem {
             !self.inline_styles.ptr_eq(new_inline_styles)
         {
             return false;
+        }
+        // #46963: fragments used as selection endpoints must belong to one DOM text node.
+        if let (Some(old), Some(new)) = (self.offsets.as_ref(), new_offsets.as_ref()) {
+            match (&old.dom_mapping, &new.dom_mapping) {
+                (Some((old_map, old_start)), Some((new_map, new_start))) => {
+                    if !Arc::ptr_eq(old_map, new_map) || old_start != new_start {
+                        return false;
+                    }
+                },
+                (None, None) => {},
+                _ => return false,
+            }
         }
         self.text.push(new_glyph_store.clone());
 

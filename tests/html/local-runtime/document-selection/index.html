@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Severin native document selection</title>
+<style>
+  body { margin: 0; padding: 4px 16px; max-width: 42em; font: 18px/1.5 sans-serif; }
+  #top { margin: 0; }
+  #wrapped { max-width: 22em; }
+  .none { user-select: none; }
+  .text { user-select: text; }
+  ::selection { background: #b0d6ff; }
+</style>
+<p id="top">Selectable text at the very top of the application viewport.</p>
+<h1>Native document text selection</h1>
+<p>Drag this ordinary paragraph. Its text contains <span>nested spans with <strong>bold text</strong></span>, punctuation, and Unicode: café 🦊 Ελληνικά.</p>
+<p id="wrapped">This paragraph is deliberately narrow so that its ordinary text wraps over several lines. Drag down from the first line to the last, then reverse direction while holding the mouse button.</p>
+<p>Whitespace and adjacent nodes: alpha   beta<!-- preserve a DOM node boundary --> gamma.</p>
+<p><a href="#destination">This link can be clicked normally or its text selected by dragging.</a></p>
+<p><button type="button">Normal button</button> <label>Existing text editing: <input value="editable text"></label></p>
+<p class="none">Restricted selection, when user-select is enabled by the runtime. <span>Inherited restriction</span>; <span class="text">explicit selectable override</span>.</p>
+<h2 id="destination">Validation</h2>
+<ol>
+  <li>Drag text forward and backward, across spans and wrapped lines. Verify a highlight appears during movement and stays after release.</li>
+  <li>Use the platform Copy shortcut, focus the input, and Paste. Compare with the selected text. Input selection and copy must still work.</li>
+  <li>Inspect window.getSelection().toString() and anchor/focus offsets in a built runtime's existing diagnostics.</li>
+  <li>Click the link and button without dragging. Verify ordinary activation. Drag the link and verify it is not activated.</li>
+  <li>Repeat at the top line, after resizing, after scrolling, and at the usual display scale.</li>
+</ol>
+<p>No JavaScript, editable overlay, or application selection code is used by this fixture.</p>
