@@ -244,9 +244,7 @@ where
             current.get_parent_node_unrooted(self.no_gc)
         };
 
-        self.current
-            .as_ref()
-            .map(|node| UnrootedDom::from_dom((*node).clone(), self.no_gc))
+        self.current.clone()
     }
 }
 
@@ -469,7 +467,7 @@ where
                 // Shadow roots don't have sibling, so after we're done traversing
                 // one we jump to the first child of the host
                 let child_option = shadow_root
-                    .host_unrooted(self.no_gc)
+                    .Host()
                     .upcast::<Node>()
                     .get_first_child_unrooted(self.no_gc);
 

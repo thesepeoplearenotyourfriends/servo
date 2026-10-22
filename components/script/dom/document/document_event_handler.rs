@@ -1283,14 +1283,6 @@ impl DocumentEventHandler {
         event: EmbedderTouchEvent,
         input_event: &ConstellationInputEvent,
     ) -> InputEventResult {
-        if event.button == MouseButton::Left {
-            if event.action == MouseButtonAction::Up {
-                self.document_selection_drag_active.set(false);
-            } else {
-                self.document_selection_drag_active.set(false);
-                self.document_selection_drag_changed.set(false);
-            }
-        }
         // Ignore all incoming events without a hit test.
         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
             self.update_active_touch_points_when_early_return(event);
@@ -1685,14 +1677,6 @@ impl DocumentEventHandler {
         event: EmbedderWheelEvent,
         input_event: &ConstellationInputEvent,
     ) -> InputEventResult {
-        if event.button == MouseButton::Left {
-            if event.action == MouseButtonAction::Up {
-                self.document_selection_drag_active.set(false);
-            } else {
-                self.document_selection_drag_active.set(false);
-                self.document_selection_drag_changed.set(false);
-            }
-        }
         // Ignore all incoming events without a hit test.
         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
             return Default::default();
