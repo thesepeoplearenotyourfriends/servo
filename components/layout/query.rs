@@ -1487,12 +1487,12 @@ pub fn find_document_text_position(
         // Compare against local bounds, not its parent's positioned rectangle.
         let size = text_fragment.base.rect().size;
         let point_in_vertical_bounds =
-            point_in_fragment.y >= Au::zero() && point_in_fragment.y <= size.height;
+            point_in_fragment.y >= Au::new(0) && point_in_fragment.y <= size.height;
         let dx = (-point_in_fragment.x)
-            .max(Au::zero())
+            .max(Au::new(0))
             .max(point_in_fragment.x - size.width);
         let dy = (-point_in_fragment.y)
-            .max(Au::zero())
+            .max(Au::new(0))
             .max(point_in_fragment.y - size.height);
         let distance = Au::from_f64_px(dx.to_f64_px().hypot(dy.to_f64_px()));
 

@@ -62,6 +62,24 @@ Use `.github/workflows/warm_command.yml` to execute checks against the requested
 
 ## Validation receipt and limits
 
+### Selection backport compilation correction (2026-10-22)
+
+The warm release compiler receipt identified 11 layout errors after PR #52. The bounded correction restores the inline builder's `display: contents` style-stack push/pop methods, imports the fork's `Utf32CodeUnits`, uses `ArcRefCell::ptr_eq` for offset-map identity, and constructs query zero values with `Au::new(0)`.
+
+Synthetic bidi controls and object replacements map one-to-one in the shared IFC offset map, as upstream does. This map's original coordinates include synthetic characters; each text run records its own original range, and hit testing subtracts that range's start. Treating controls as `(0, new_characters)` creates duplicate original boundaries and can shift neighboring selection endpoints. The builder regression covers empty controls, object replacement, nested bidi opening/closing controls, Unicode scalar versus UTF-8 counts, collapsed leading whitespace, and expanded case mapping in the following node.
+
+Local validation: 10 standalone tests passed, including the new builder regression, five production offset-map tests, and four Unicode tests. Restoring `(0, new_characters)` makes the new test fail. The standalone harness uses the production Unicode/map/cell code and the builder method/test with only its relevant fields; heap-accounting derives are omitted. It does not type-check the complete layout or script crates. Locked workspace metadata resolves both crates. `cargo check --locked --offline --release -p servo-layout -p servo-script` stops before compilation because `accesskit v0.24.0` is not cached. This instance has no warm target directory, its shell proxy is unreachable, and its GitHub CLI authentication is unavailable. No further Rust compiler failures have been established.
+
+Required warm receipt for the correction branch, using **Warm Debian 12 Command**:
+
+```sh
+cargo check --locked --release -p servo-layout -p servo-script
+cargo test --locked --release -p servo-layout --lib control_characters_preserve_neighboring_selection_boundaries
+cargo test --locked --release -p servo-layout --lib offset_map
+```
+
+Run these with failure propagation (`set -Eeuo pipefail`) before the next warm release build. NO CARRIER resource/transport invariants, Python bridge, egui, and file-opening behavior are unchanged.
+
 Current cloud checks: four Unicode/base tests passed, five production offset-map tests passed, and four existing package-isolation URL tests passed. Cargo workspace metadata resolves with `--locked`. The new WPT files pass the repository's WPT lint. Rust parsing/formatting and focused source-tidiness checks are recorded in the progress log.
 
 These checks do **not** establish that `servo-script`/layout/servoshell type-check together or that physical mouse/highlight/system clipboard behavior works. A warm engine build, the new WPT runs/reftest, and physical GUI/clipboard checks remain required before a readiness claim. GitHub API access initially failed, then succeeded; draft PR #52 and warm validation are available. The first warm run failed before compilation because the restored snapshot carried a dirty Cargo.lock. The workflow now preserves that snapshot file before syncing the requested commit.

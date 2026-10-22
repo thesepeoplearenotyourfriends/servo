@@ -965,7 +965,7 @@ impl TextRunLineItem {
         if let (Some(old), Some(new)) = (self.offsets.as_ref(), new_offsets.as_ref()) {
             match (&old.dom_mapping, &new.dom_mapping) {
                 (Some((old_map, old_start)), Some((new_map, new_start))) => {
-                    if !Arc::ptr_eq(old_map, new_map) || old_start != new_start {
+                    if !old_map.ptr_eq(new_map) || old_start != new_start {
                         return false;
                     }
                 },
