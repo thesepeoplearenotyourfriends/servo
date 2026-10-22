@@ -8126,6 +8126,7 @@ dependencies = [
 name = "servo-layout"
 version = "0.3.0"
 dependencies = [
+ "arrayvec",
  "accesskit",
  "app_units",
  "atomic_refcell",
@@ -9234,6 +9235,7 @@ dependencies = [
  "serde_json",
  "servo",
  "url",
+ "winit",
 ]
 
 [[package]]

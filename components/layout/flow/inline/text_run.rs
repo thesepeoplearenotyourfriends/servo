@@ -7,15 +7,18 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use app_units::Au;
+use atomic_refcell::AtomicRefCell;
 use fonts::{
-    FontContext, FontRef, ShapedTextSlice, ShapedTextSlicer, ShapingFlags, ShapingOptions,
+    ByteIndex, FontContext, FontRef, ShapedTextSlice, ShapedTextSlicer, ShapingFlags,
+    ShapingOptions, TextByteRange,
 };
 use icu_locid::subtags::Language;
 use icu_properties::{self, LineBreak};
+use layout_api::ScriptSelection;
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc as ServoArc;
-use servo_base::text::is_bidi_control;
+use servo_base::text::{Utf32CodeUnitLength, is_bidi_control};
 use style::Zero;
 use style::computed_values::font_kerning::T as FontKerning;
 use style::computed_values::font_variant_position::T as FontVariantPosition;
@@ -37,6 +40,7 @@ use crate::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom::WeakLayoutBox;
 use crate::flow::inline::line::TextRunOffsets;
+use crate::flow::inline::text_transform::OffsetMap;
 use crate::flow::inline::{BidiLevels, LineBlockSizes, LineItem, SegmentContentFlags};
 use crate::fragment_tree::BaseFragmentInfo;
 
@@ -240,14 +244,25 @@ impl TextRunSegment {
         let mut character_range_start = self.character_range.start;
         for (run_index, run) in self.runs.iter().enumerate() {
             let new_character_range_end = character_range_start + run.character_count();
-            let offsets = ifc
-                .ifc
-                .shared_selection
-                .clone()
-                .map(|shared_selection| TextRunOffsets {
-                    shared_selection,
-                    character_range: character_range_start..new_character_range_end,
-                });
+            let is_document_text = ifc.ifc.shared_selection.is_none();
+            let shared_selection = ifc.ifc.shared_selection.clone().unwrap_or_else(|| {
+                Arc::new(AtomicRefCell::new(ScriptSelection {
+                    range: TextByteRange::new(ByteIndex::zero(), ByteIndex::zero()),
+                    character_range: text_run.document_selection.start.0
+                        ..text_run.document_selection.end.0,
+                    enabled: !text_run.document_selection.is_empty(),
+                }))
+            });
+            let offsets = Some(TextRunOffsets {
+                shared_selection,
+                character_range: character_range_start..new_character_range_end,
+                dom_mapping: is_document_text.then(|| {
+                    (
+                        text_run.offset_map.clone(),
+                        text_run.original_text_range.clone(),
+                    )
+                }),
+            });
 
             // Break before each unbreakable run in this TextRun, except the first unless the
             // linebreaker was set to break before the first run.
@@ -435,9 +450,16 @@ pub(crate) struct TextRun {
     pub text_range: Range<usize>,
 
     /// The range of characters in this text in [`super::InlineFormattingContext::text_content`]
-    /// of the [`super::InlineFormattingContext`] that owns this [`TextRun`]. These are *not*
-    /// UTF-8 offsets.
+    /// of the [`super::InlineFormattingContext`] that owns this [`TextRun`].
+    /// These are counting `char`s, *not* UTF-8 offsets.
     pub character_range: Range<usize>,
+
+    /// The range of `char` characters in this `TextRun` that overlap the Document’s selection
+    pub document_selection: Range<Utf32CodeUnitLength>,
+    /// Upstream #46864/#47022/#47025: map transformed IFC glyph positions back to this node.
+    #[ignore_malloc_size_of = "Shared with the inline formatting context"]
+    pub offset_map: ArcRefCell<OffsetMap>,
+    pub original_text_range: Range<Utf32CodeUnitLength>,
 
     /// The [`TextRunItem`]s of this text run. This is produced by segmenting the incoming text
     /// by things such as font and script as well as separating out hard line breaks.
@@ -451,6 +473,9 @@ impl TextRun {
         inline_styles: SharedInlineStyles,
         text_range: Range<usize>,
         character_range: Range<usize>,
+        document_selection: Range<Utf32CodeUnitLength>,
+        offset_map: ArcRefCell<OffsetMap>,
+        original_text_range: Range<Utf32CodeUnitLength>,
         old_text_run: Option<ArcRefCell<TextRun>>,
     ) -> Self {
         // If there was a previous box tree layout of this text run, try to preserve the old shaped text.
@@ -463,6 +488,9 @@ impl TextRun {
             inline_styles,
             text_range,
             character_range,
+            document_selection,
+            offset_map,
+            original_text_range,
             items,
         }
     }

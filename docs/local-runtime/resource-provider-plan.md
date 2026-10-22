@@ -183,3 +183,7 @@ The private frame format in both directions is:
 The receipt remains transport-private and outside application JSON. Rust keeps only transport/lifetime limits: frame size, live receipts, queue/byte limits, rate limits, stale receipts, navigation/close invalidation, and bounded delivery work. It does not define action names, capability names, schemas, success/error envelopes, or host-function registries.
 
 `ports/severin-python` remains experimental/manual/headless/in-process embedding work under a distinct native-extension import identity. It is no longer the visible desktop rendering foundation and should not grow a replacement headed GUI lifecycle.
+
+### Native selection and copying
+
+Ordinary document selection remains inside Servo's DOM/layout machinery. Copy uses the existing native editing action and host clipboard message; it adds no loader, remote fallback, Python authority path, or general clipboard API. The implementation and validation boundary are documented in [native-document-selection.md](native-document-selection.md).

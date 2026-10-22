@@ -2590,6 +2590,10 @@ impl Window {
             None
         };
 
+        if let Some(selection) = document.selection() {
+            selection.set_flags_for_visible_selection(cx.no_gc());
+        }
+
         let restyle_reason = document.restyle_reason();
         document.clear_restyle_reasons();
         let restyle = if restyle_reason.needs_restyle() {
@@ -3076,6 +3080,25 @@ impl Window {
         self.layout
             .borrow()
             .query_text_index(node.to_trusted_node_address(), point_in_viewport)
+    }
+
+    /// The #47048 DOM/glyph hit query, adapted to the fork's existing layout query interface.
+    #[expect(unsafe_code)]
+    pub(crate) fn document_text_position_query(
+        &self,
+        node: &Node,
+        point: Point2D<f32, CSSPixel>,
+    ) -> Option<(DomRoot<Node>, servo_base::text::Utf32CodeUnitsOrNodeOffset)> {
+        self.layout_reflow(QueryMsg::TextIndexQuery);
+        let (address, offset) = self.layout.borrow().query_document_text_position(
+            node.to_trusted_node_address(),
+            point.map(Au::from_f32_px),
+        )?;
+        // Layout has just run, so the returned node belongs to the current fragment tree.
+        Some((
+            unsafe { from_untrusted_node_address(address) },
+            servo_base::text::Utf32CodeUnitsOrNodeOffset(offset),
+        ))
     }
 
     pub(crate) fn elements_from_point_query(

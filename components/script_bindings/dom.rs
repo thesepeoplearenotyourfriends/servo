@@ -63,6 +63,18 @@ impl<T: DomObject> MutDom<T> {
         assert_in_script();
         unsafe { DomRoot::from_ref(&*ptr::read(self.val.get())) }
     }
+
+    /// Get a reference to the traced inner value of this [`MutDom`].
+    ///
+    /// # Safety
+    ///
+    /// - The caller *must not* modify the value of the [`MutDom`] while the
+    ///   reference is alive.
+    /// - The caller *must ensure* that no garbage collection happens while the
+    ///   reference is alive.
+    pub unsafe fn as_ref_unsafe(&self) -> &Dom<T> {
+        unsafe { &*self.val.get() }
+    }
 }
 
 impl<T: DomObject> MallocSizeOf for MutDom<T> {
@@ -99,6 +111,16 @@ impl<'a, T: DomObject> UnrootedDom<'a, T> {
         UnrootedDom {
             inner: object,
             no_gc,
+        }
+    }
+}
+
+// Cloning preserves the same NoGC lifetime; it never turns an unrooted value into a root.
+impl<T: DomObject> Clone for UnrootedDom<'_, T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            no_gc: self.no_gc,
         }
     }
 }
@@ -162,6 +184,13 @@ impl<'a, T: DomObject> PartialEq<UnrootedDom<'a, T>> for UnrootedDom<'a, T> {
 /// Only [`LayoutDom`] should implement this.
 pub unsafe trait LayoutFromRaw<'dom, T: DomObject> {
     fn from_raw(d: &'dom T) -> Self;
+}
+
+impl<'dom, T: DomObject, L: LayoutFromRaw<'dom, T>> ToLayout<'dom, T, L> for MutDom<T> {
+    unsafe fn to_layout(&self) -> L {
+        assert_in_layout();
+        unsafe { self.as_ref_unsafe().to_layout() }
+    }
 }
 
 /// A holder that provides interior mutability for GC-managed values such as

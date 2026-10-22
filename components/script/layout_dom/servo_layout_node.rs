@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::ops::Range;
 
 use layout_api::{
     GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutDataTrait, LayoutElement, LayoutNode,
@@ -16,6 +17,7 @@ use net_traits::image_cache::Image;
 use pixels::ImageMetadata;
 use servo_arc::Arc;
 use servo_base::id::{BrowsingContextId, PipelineId};
+use servo_base::text::Utf32CodeUnitLength;
 use servo_url::ServoUrl;
 use style;
 use style::context::SharedStyleContext;
@@ -186,9 +188,11 @@ impl<'dom> LayoutNode<'dom> for ServoLayoutNode<'dom> {
 
     fn selected_style(&self, context: &SharedStyleContext) -> Arc<ComputedValues> {
         let Some(element) = self.as_element() else {
-            // TODO(stshine): What should the selected style be for text?
             debug_assert!(self.is_text_node());
-            return self.parent_style(context);
+            // Anonymous text containers use the originating parent's ::selection style too.
+            return unsafe { self.dangerous_flat_tree_parent() }
+                .map(|parent| parent.selected_style(context))
+                .unwrap_or_else(|| self.parent_style(context));
         };
 
         let style_data = &element.element_data().styles;
@@ -244,6 +248,10 @@ impl<'dom> LayoutNode<'dom> for ServoLayoutNode<'dom> {
 
     fn text_content(self) -> Cow<'dom, str> {
         self.node.text_content()
+    }
+
+    fn document_selection_in_text_node(&self) -> Option<Range<Utf32CodeUnitLength>> {
+        self.node.document_selection_in_text_node()
     }
 
     fn selection(&self) -> Option<SharedSelection> {

@@ -117,7 +117,9 @@ use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementType
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
-use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout, UnrootedDom};
+use crate::dom::bindings::root::{
+    Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout, ToLayoutOptional, UnrootedDom,
+};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::trace::{HashMapTracedValues, NoTrace};
 use crate::dom::bindings::weakref::DOMTracker;
@@ -881,6 +883,12 @@ impl Document {
     #[inline]
     pub(crate) fn current_rendering_epoch(&self) -> Epoch {
         self.current_rendering_epoch.get()
+    }
+
+    /// Get the [`Selection`] instance for this [`Document`] if there is one or `None`.
+    #[inline]
+    pub(crate) fn selection(&self) -> Option<DomRoot<Selection>> {
+        self.selection.get()
     }
 
     pub(crate) fn set_activity(&self, cx: &mut JSContext, activity: DocumentActivity) {
@@ -2866,10 +2874,13 @@ impl Document {
         if !self.is_fully_active() {
             return false;
         }
-        if !self.window().layout_blocked() &&
-            (!self.restyle_reason().is_empty() ||
-                self.window().layout().needs_new_display_list() ||
-                self.window().layout().needs_accessibility_update())
+        if !self.window().layout_blocked()
+            && (!self.restyle_reason().is_empty()
+                || self
+                    .selection()
+                    .is_some_and(|selection| selection.visible_selection_is_dirty())
+                || self.window().layout().needs_new_display_list()
+                || self.window().layout().needs_accessibility_update())
         {
             return true;
         }
@@ -3443,6 +3454,11 @@ pub(crate) enum DocumentSource {
 }
 
 impl<'dom> LayoutDom<'dom, Document> {
+    #[expect(unsafe_code)]
+    pub(crate) fn selection_for_layout(&self) -> Option<LayoutDom<'dom, Selection>> {
+        unsafe { self.unsafe_get().selection.to_layout() }
+    }
+
     #[inline]
     pub(crate) fn is_html_document_for_layout(&self) -> bool {
         self.unsafe_get().is_html_document

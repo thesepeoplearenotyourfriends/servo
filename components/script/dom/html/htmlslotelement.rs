@@ -341,6 +341,9 @@ impl HTMLSlotElement {
         for slottable in slottables.iter() {
             slottable.set_assigned_slot(Some(self));
         }
+        if let Some(selection) = self.owner_document().selection() {
+            selection.set_visible_selection_dirty();
+        }
     }
 
     /// <https://dom.spec.whatwg.org/#signal-a-slot-change>

@@ -954,10 +954,7 @@ impl Fragment {
     ) {
         // NB: The order of painting text components (CSS Text Decoration Module Level 3) is:
         // shadows, underline, overline, text, text-emphasis, and then line-through.
-        let rect = fragment
-            .base
-            .rect()
-            .translate(containing_block.origin.to_vector());
+        let rect = fragment.base.rect().translate(state.origin.to_vector());
         let mut baseline_origin = rect.origin;
         baseline_origin.y += fragment.font_metrics.ascent;
 
@@ -1012,6 +1009,15 @@ impl Fragment {
             );
         }
 
+        Self::build_display_list_for_text_selection(
+            fragment,
+            builder,
+            state,
+            containing_block,
+            fragment.base.rect().min_x(),
+            fragment.justification_adjustment,
+        );
+
         for text_decoration in state.text_decorations.iter() {
             if text_decoration.line.contains(TextDecorationLine::UNDERLINE) {
                 let mut rect = rect;
@@ -1045,15 +1051,6 @@ impl Fragment {
                 );
             }
         }
-
-        Self::build_display_list_for_text_selection(
-            fragment,
-            builder,
-            state,
-            containing_block,
-            fragment.base.rect().min_x(),
-            fragment.justification_adjustment,
-        );
 
         builder.wr().push_text(
             &common,
@@ -1200,7 +1197,9 @@ impl Fragment {
         };
 
         let shared_selection = offsets.shared_selection.borrow();
-        if !shared_selection.enabled {
+        if !shared_selection.enabled
+            || (offsets.dom_mapping.is_some() && shared_selection.character_range.is_empty())
+        {
             return;
         }
 
@@ -1262,10 +1261,12 @@ impl Fragment {
         let end_x = end_advance.unwrap_or(current_advance);
 
         let parent_style = fragment.base.style();
-        if !shared_selection.range.is_empty() {
+        if !shared_selection.character_range.is_empty() {
             let selection_rect = Rect::new(
-                containing_block_rect.origin +
-                    Vector2D::new(fragment_x_offset + start_x, Au::zero()),
+                euclid::Point2D::new(
+                    state.origin.x + fragment_x_offset + start_x,
+                    containing_block_rect.min_y(),
+                ),
                 Size2D::new(end_x - start_x, containing_block_rect.height()),
             )
             .to_webrender();
@@ -1286,10 +1287,12 @@ impl Fragment {
         }
 
         let insertion_point_rect = Rect::new(
-            containing_block_rect.origin + Vector2D::new(start_x + fragment_x_offset, Au::zero()),
+            state.origin
+                + fragment.base.rect().origin.to_vector()
+                + Vector2D::new(start_x, Au::zero()),
             Size2D::new(
                 INSERTION_POINT_LOGICAL_WIDTH,
-                containing_block_rect.height(),
+                fragment.font_metrics.line_gap,
             ),
         )
         .to_webrender();

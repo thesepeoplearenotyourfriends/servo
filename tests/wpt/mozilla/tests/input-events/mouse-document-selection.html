@@ -1,0 +1,140 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native mouse selection of ordinary document text</title>
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/resources/testdriver.js"></script>
+<script src="/resources/testdriver-actions.js"></script>
+<script src="/resources/testdriver-vendor.js"></script>
+<link rel="stylesheet" href="/fonts/ahem.css">
+<style>
+  body { margin: 0; }
+  #fixture { position: absolute; top: 4px; left: 8px; font: 20px/24px Ahem; }
+  p { margin: 0 0 12px; }
+  #wrapped { width: 12ch; }
+  b { font-weight: normal; }
+  #unicode { font-family: monospace; }
+  #none { user-select: none; }
+</style>
+<div id="fixture">
+<p id="nested">alpha <span>beta <b>gamma</b></span> delta</p>
+<p id="wrapped">one two three four five six seven eight</p>
+<p id="unicode">a🦊b café</p>
+<p id="adjacent">abc<!-- separate text nodes -->def   ghi</p>
+<p><a id="link" href="#activated">ordinary link text</a></p>
+<p><button id="button">button</button><input id="input" value="abcdef"></p>
+<p id="none">restricted text</p>
+</div>
+<script>
+function point(node, offset) {
+  // Range geometry in this baseline does not yet resolve partial text-node bounds.
+  // Use Ahem's fixed advances and the paragraph origin, not selection geometry.
+  const paragraph = node.parentElement.closest('p');
+  const rect = paragraph.getBoundingClientRect();
+  if (paragraph === wrapped) {
+    // The 12ch line box wraps at offsets 8, 19, and 28.
+    const lineStart = [0, 8, 19, 28].filter(start => start <= offset).pop();
+    const line = [0, 8, 19, 28].indexOf(lineStart);
+    return {x: rect.left + 20 * (offset - lineStart), y: rect.top + line * 24 + 12};
+  }
+  const prefix = document.createRange();
+  prefix.setStart(paragraph, 0);
+  prefix.setEnd(node, offset);
+  const text = prefix.toString().replace(/\s+/g, ' ');
+  let width = text.length * 20;
+  if (paragraph === unicode) {
+    const context = document.createElement('canvas').getContext('2d');
+    context.font = '20px monospace';
+    width = context.measureText(text).width;
+  }
+  return {x: rect.left + width, y: rect.top + 12};
+}
+async function drag(start, end, whilePressed) {
+  await new test_driver.Actions().pointerMove(start.x, start.y).pointerDown()
+    .pointerMove(end.x, end.y).send();
+  try {
+    if (whilePressed) whilePressed();
+  } finally {
+    await new test_driver.Actions().pointerUp().send();
+  }
+}
+function selected() { return window.getSelection().toString(); }
+
+promise_test(async t => {
+  await document.fonts.ready;
+  const first = nested.firstChild;
+  const last = nested.lastChild;
+  await drag(point(first, 1), point(last, 3), () => {
+    assert_equals(selected(), 'lpha beta gamma de', 'DOM selection updates while pressed');
+  });
+  assert_equals(selected(), 'lpha beta gamma de');
+  assert_equals(getSelection().anchorNode, first);
+  assert_equals(getSelection().focusNode, last);
+  await drag(point(last, 3), point(first, 1));
+  assert_equals(selected(), 'lpha beta gamma de');
+  assert_equals(getSelection().anchorNode, last);
+  assert_equals(getSelection().focusNode, first);
+}, 'Forward and backward drag across nested inline nodes at the top of the viewport');
+
+promise_test(async t => {
+  const text = wrapped.firstChild;
+  await drag(point(text, 1), point(text, 30));
+  assert_equals(selected(), text.data.slice(1, 30));
+}, 'Selection spans soft-wrapped lines and survives mouse release');
+
+promise_test(async t => {
+  const text = unicode.firstChild;
+  await drag(point(text, 1), point(text, 4));
+  assert_equals(selected(), '🦊b');
+  assert_equals(getSelection().anchorOffset, 1);
+  assert_equals(getSelection().focusOffset, 4);
+}, 'Glyph positions become UTF-16 DOM offsets for non-BMP text');
+
+promise_test(async t => {
+  await drag(point(adjacent.firstChild, 1), point(adjacent.lastChild, 9));
+  assert_equals(selected(), 'bcdef   ghi');
+}, 'Adjacent text nodes and collapsed whitespace retain original DOM text offsets');
+
+promise_test(async t => {
+  let clicks = 0;
+  link.addEventListener('click', () => clicks++);
+  const text = link.firstChild;
+  await drag(point(text, 1), point(text, 7));
+  assert_equals(selected(), 'rdinar');
+  assert_equals(clicks, 0, 'Dragging link text does not activate the link');
+  await test_driver.click(link);
+  assert_equals(clicks, 1, 'An ordinary click still activates the link');
+  let buttonClicks = 0;
+  button.addEventListener('click', () => buttonClicks++);
+  await test_driver.click(button);
+  assert_equals(buttonClicks, 1);
+  await test_driver.click(input);
+  assert_equals(document.activeElement, input);
+  assert_true(getSelection().isCollapsed, 'Control interaction does not start a document selection');
+}, 'Links, buttons, and existing text controls keep their normal activation');
+
+promise_test(async t => {
+  getSelection().removeAllRanges();
+  const cancel = event => event.preventDefault();
+  nested.addEventListener('mousedown', cancel);
+  t.add_cleanup(() => nested.removeEventListener('mousedown', cancel));
+  await drag(point(nested.firstChild, 1), point(nested.lastChild, 3));
+  assert_equals(selected(), '');
+}, 'Canceling mousedown prevents native selection');
+
+promise_test(async t => {
+  getSelection().removeAllRanges();
+  const cancel = event => event.preventDefault();
+  nested.addEventListener('pointerdown', cancel);
+  t.add_cleanup(() => nested.removeEventListener('pointerdown', cancel));
+  await drag(point(nested.firstChild, 1), point(nested.lastChild, 3));
+  assert_equals(selected(), '');
+}, 'Canceling pointerdown prevents native selection');
+
+promise_test(async t => {
+  assert_implements_optional(CSS.supports('user-select', 'none'), 'Pinned Stylo gates user-select behind layout.unimplemented');
+  getSelection().removeAllRanges();
+  await drag(point(none.firstChild, 1), point(none.firstChild, 10));
+  assert_equals(selected(), '');
+}, 'user-select:none prevents a document selection where the CSS property is supported');
+</script>

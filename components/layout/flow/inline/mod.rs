@@ -72,7 +72,9 @@ pub mod construct;
 pub mod inline_box;
 pub mod line;
 mod line_breaker;
+pub(crate) mod offset_map;
 pub mod text_run;
+pub mod text_transform;
 
 use std::cell::{OnceCell, RefCell};
 use std::mem;
@@ -1646,6 +1648,7 @@ impl InlineFormattingContextLayout<'_> {
         let offsets = TextRunOffsets {
             shared_selection,
             character_range: line_start_offset..line_start_offset + 1,
+            dom_mapping: None,
         };
 
         // If the last content line item is a text item, then the placeholder for the text caret is not necessary.

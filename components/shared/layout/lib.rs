@@ -402,6 +402,12 @@ pub trait Layout {
         node: TrustedNodeAddress,
         point: Point2D<Au, CSSPixel>,
     ) -> Option<usize>;
+    /// Find a selectable DOM text node and a Unicode scalar offset at a viewport point.
+    fn query_document_text_position(
+        &self,
+        node: TrustedNodeAddress,
+        point: Point2D<Au, CSSPixel>,
+    ) -> Option<(UntrustedNodeAddress, usize)>;
     fn query_elements_from_point(&self, point: LayoutPoint) -> Vec<ElementsFromPointResult>;
     fn query_effective_overflow(&self, node: TrustedNodeAddress) -> Option<AxesOverflow>;
     fn stylist_mut(&mut self) -> &mut Stylist;

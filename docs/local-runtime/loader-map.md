@@ -77,3 +77,7 @@ For loader-map purposes, the bridge should be treated as host-mediated external 
 ## Visible runtime bridge note
 
 The visible runtime bridge is not a loader-map resource destination. The headed Severin executable uses the normal servoshell event loop and package-mode `asset://` loading for documents and subresources, while the optional Python bridge is a private inherited-FD mailbox for host-mediated external effects. It must not become a fallback resource loader or hidden network path.
+
+## Native document selection
+
+Document mouse selection is a script/layout interaction and does not acquire resources. It uses the existing DOM range, glyph-offset queries, selection painting, and trusted embedder clipboard action. Package URL resolution and transport denials are unchanged. See [native-document-selection.md](native-document-selection.md) for upstream provenance, regression targets, the local fixture, and outstanding build/GUI validation.
