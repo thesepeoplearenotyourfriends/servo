@@ -1719,7 +1719,7 @@ impl Node {
                     let Some(shadow_root) = n.downcast::<ShadowRoot>()
                 {
                     return Some(UnrootedDom::from_dom(
-                        Dom::from_ref(shadow_root.host_unrooted(no_gc).upcast::<Node>()),
+                        Dom::from_ref(shadow_root.Host().upcast::<Node>()),
                         no_gc,
                     ));
                 }

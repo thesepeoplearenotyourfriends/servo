@@ -244,7 +244,9 @@ where
             current.get_parent_node_unrooted(self.no_gc)
         };
 
-        self.current.clone()
+        self.current
+            .as_ref()
+            .map(|node| UnrootedDom::from_dom((**node).clone(), self.no_gc))
     }
 }
 
