@@ -1447,7 +1447,12 @@ pub fn find_character_offset_in_fragment_descendants(
                     .map(|base| base.rect().origin)
                     .unwrap_or_default();
                 let point = point_in_viewport - offset.to_vector() + scroll_offset;
-                collect_relevant_children(child, point, closest_relative_fragment, stacking_context_tree);
+                collect_relevant_children(
+                    child,
+                    point,
+                    closest_relative_fragment,
+                    stacking_context_tree,
+                );
             }
         }
     }
@@ -1457,7 +1462,12 @@ pub fn find_character_offset_in_fragment_descendants(
         if let Some(point_in_fragment) =
             stacking_context_tree.offset_in_fragment(fragment, point_in_viewport)
         {
-            collect_relevant_children(fragment, point_in_fragment, &mut closest_relative_fragment, stacking_context_tree);
+            collect_relevant_children(
+                fragment,
+                point_in_fragment,
+                &mut closest_relative_fragment,
+                stacking_context_tree,
+            );
         }
     }
 
