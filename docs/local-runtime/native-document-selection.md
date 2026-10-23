@@ -62,6 +62,30 @@ Use `.github/workflows/warm_command.yml` to execute checks against the requested
 
 ## Validation receipt and limits
 
+### Stale highlight cleanup (2026-10-23)
+
+The first divergence is in `Selection::unset_flags_for_visible_selection`, before layout invalidation. Its manually advanced flat-tree iterator consumed `next` using `take()` but never replenished it on `PrePostIteration::Leave`. Both leaving a selected leaf and skipping an unselected subtree produce that event. In an ordinary document, skipping the unflagged `head` can stop cleanup before any selected body text is reached. Ancestor flags have already been cleared, while later selected text retains its flags and cached layout.
+
+The correction advances on exit events too. The existing ancestor-flag pruning remains valid after a complete traversal. Old selected character data now receives `NodeDamage::ContentOrHeritage`; `Node::dirty` drops its cached text run and dirties the parent. `Window::reflow` performs this before draining restyle reasons. Layout then maps the current live selection into replacement text runs/fragments, and display-list construction reads their new shared selection. `Document::needs_rendering_update` already schedules dirty selections, and the existing rendering-update path generates the resulting frame. No new repaint loop, unconditional rebuild, or clipboard/input change is needed.
+
+`document_selection_replacement_collapse_and_clear_remove_old_pixels` in the existing embedder test compares completed-scene screenshots against direct-selection and unselected pixel oracles. It covers disjoint offsets, different paragraphs, collapse, remove-all-ranges, wrapped nested inline text, coalesced changes, and changes across completed scenes. It also checks DOM state and trusted copy of the replacement passages. `WebView::take_screenshot` waits until rendering is up to date with no pending frames; rAF alone is not treated as presentation acknowledgment. The new `document-selection-replacement-paint.html` WPT independently compares a wrapped/nested-to-disjoint replacement with an explicit highlight reference, checking the final DOM boundaries as well. Its double rAF provides an intermediate rendering opportunity; only the runner's screenshot checks the final visual result.
+
+Local receipt: three isolated tests compile the exact old/new production cleanup method against an Enter/Leave flat-tree adapter. All three fail before the correction with stale flags and pass afterward, checking invalidation of every selected text node. This isolates cleanup control flow and does not execute Servo's DOM, layout, or compositor. WPT lint passes for both existing and new paint test/reference pairs. The modified Rust parses, the embedder test passes rustfmt, and `git diff --check` passes.
+
+Engine execution is deferred: this instance has a focused Rust toolchain but no warm engine target directory. No cold script/layout/workspace build was attempted. The GitHub connector supports PR creation but has no workflow-dispatch tool; shell GitHub API access returns `Forbidden`, preventing dispatch of the established warm workflow from this session. Run the following on the review branch with **Warm Debian 12 Command**, with `set -Eeuo pipefail`:
+
+```sh
+cargo test --locked --release -p servo --test document_selection -- --test-threads=1
+./mach build --release
+./mach test-wpt --release /_mozilla/input-events/document-selection-paint.html
+./mach test-wpt --release /_mozilla/input-events/document-selection-replacement-paint.html
+./mach test-wpt --release /_mozilla/input-events/mouse-document-selection.html
+./mach test-wpt --release /_mozilla/input-events/mouse-text-selection-input-text.html
+./mach test-wpt --release /_mozilla/input-events/mouse-text-selection-textarea.html
+```
+
+These engine tests have not run here. After they pass, physical headed testing must still confirm desktop frame presentation, native mouse replacement/collapse, and the real Ctrl+C host/OS clipboard route. Source parsing and the isolated cleanup adapter do not establish graphical success.
+
 ### Selection backport compilation correction (2026-10-22)
 
 The warm release compiler receipt identified 11 layout errors after PR #52. The bounded correction restores the inline builder's `display: contents` style-stack push/pop methods, imports the fork's `Utf32CodeUnits`, uses `ArcRefCell::ptr_eq` for offset-map identity, and constructs query zero values with `Au::new(0)`.

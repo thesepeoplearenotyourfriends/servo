@@ -1420,11 +1420,11 @@ pub fn find_character_offset_in_fragment_descendants(
 
     fn collect_relevant_children(
         fragment: &Fragment,
-        point_in_viewport: Point2D<Au, CSSPixel>,
+        point_in_fragment: Point2D<Au, CSSPixel>,
         closest_relative_fragment: &mut Option<ClosestFragment>,
         stacking_context_tree: &StackingContextTree,
     ) {
-        maybe_update_closest(fragment, point_in_viewport, closest_relative_fragment);
+        maybe_update_closest(fragment, point_in_fragment, closest_relative_fragment);
 
         if let Some(children) = fragment.children() {
             // The box itself is positioned in its parent's spatial node, while
@@ -1446,7 +1446,7 @@ pub fn find_character_offset_in_fragment_descendants(
                     .base()
                     .map(|base| base.rect().origin)
                     .unwrap_or_default();
-                let point = point_in_viewport - offset.to_vector() + scroll_offset;
+                let point = point_in_fragment - offset.to_vector() + scroll_offset;
                 collect_relevant_children(
                     child,
                     point,

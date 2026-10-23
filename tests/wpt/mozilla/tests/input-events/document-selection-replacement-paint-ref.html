@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Reference for replacing a wrapped nested selection</title>
+<link rel="stylesheet" href="/fonts/ahem.css">
+<style>
+  body { margin: 0; }
+  p { position: relative; margin: 0; width: 7ch; font: 20px/24px Ahem; }
+  .highlight { position: absolute; left: 80px; top: 0; width: 60px; height: 24px;
+               background: rgb(176, 214, 255); }
+  .text { position: relative; }
+</style>
+<p>abc <span>def <b>ghi</b> jkl</span></p>
+<p><span class="highlight"></span><span class="text">mno pqr</span></p>

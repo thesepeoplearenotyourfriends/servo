@@ -915,14 +915,16 @@ impl<T: ClipboardProvider> TextInput<T> {
         self.currently_dragging = true;
         match mouse_event.upcast::<UIEvent>().Detail() {
             3 => {
-                let word_boundaries = self.rope.line_boundaries(self.edit_point);
+                let edit_point = self.edit_point_for_mouse_event(node, mouse_event);
+                let word_boundaries = self.rope.line_boundaries(edit_point);
                 self.edit_point = word_boundaries.end;
                 self.selection_origin = Some(word_boundaries.start);
                 self.update_selection_direction();
                 true
             },
             2 => {
-                let word_boundaries = self.rope.relevant_word_boundaries(self.edit_point);
+                let edit_point = self.edit_point_for_mouse_event(node, mouse_event);
+                let word_boundaries = self.rope.relevant_word_boundaries(edit_point);
                 self.edit_point = word_boundaries.end;
                 self.selection_origin = Some(word_boundaries.start);
                 self.update_selection_direction();

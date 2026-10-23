@@ -422,8 +422,8 @@ impl TextFragment {
         &self,
         point_in_fragment: Point2D<Au, CSSPixel>,
     ) -> bool {
-        let rect = &self.base.rect();
-        rect.min_y() <= point_in_fragment.y && rect.max_y() >= point_in_fragment.y
+        let height = self.base.rect().height();
+        Au::zero() <= point_in_fragment.y && height >= point_in_fragment.y
     }
 
     /// Find the distance between for point relative to a [`TextFragment`] for the
@@ -435,13 +435,15 @@ impl TextFragment {
     ) -> Au {
         // This is the distance between the closest point on the edge of the rectangle and
         // the point. From <https://stackoverflow.com/a/18157551>.
-        let rect = &self.base.rect();
-        let dx = (rect.min_x() - point_in_fragment.x)
+        // The query has already subtracted this fragment's origin. Its bounds
+        // in this coordinate space start at zero, regardless of its line/column.
+        let size = self.base.rect().size;
+        let dx = (-point_in_fragment.x)
             .max(Au::zero())
-            .max(point_in_fragment.x - rect.max_x());
-        let dy = (rect.min_y() - point_in_fragment.y)
+            .max(point_in_fragment.x - size.width);
+        let dy = (-point_in_fragment.y)
             .max(Au::zero())
-            .max(point_in_fragment.y - rect.max_y());
+            .max(point_in_fragment.y - size.height);
         Au::from_f64_px((dx.to_f64_px().powi(2) + dy.to_f64_px().powi(2)).sqrt())
     }
 
@@ -468,7 +470,7 @@ impl TextFragment {
         //
         // TODO: It would be nice to just return the last offset here, but <textarea>
         // does not currently make a fragment for all selection indices.
-        if point_in_fragment.y > self.base.rect().max_y() + max_vertical_offset {
+        if point_in_fragment.y > self.base.rect().height() + max_vertical_offset {
             return None;
         }
 
@@ -593,5 +595,71 @@ impl ContainingBlockCalculation<'_> {
 impl<'a> From<&'a LayoutThread> for ContainingBlockCalculation<'a> {
     fn from(layout_thread: &'a LayoutThread) -> Self {
         Self::Lazy { layout_thread }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use style::properties::{ComputedValues, style_structs::Font};
+    use webrender_api::IdNamespace;
+
+    use super::*;
+    use crate::fragment_tree::BaseFragmentInfo;
+
+    fn caret_fragment(x: i32, y: i32) -> TextFragment {
+        let style = ArcRefCell::new(
+            ComputedValues::initial_values_with_font_override(Font::initial_values()).to_arc(),
+        );
+        TextFragment {
+            base: BaseFragment::new(
+                BaseFragmentInfo::anonymous(),
+                style.clone(),
+                PhysicalRect::new(
+                    Point2D::new(Au::from_px(x), Au::from_px(y)),
+                    Size2D::new(Au::from_px(80), Au::from_px(20)),
+                ),
+            ),
+            selected_style: style,
+            font_metrics: Default::default(),
+            font_key: FontInstanceKey(IdNamespace(0), 0),
+            glyphs: Vec::new(),
+            justification_adjustment: Au::zero(),
+            offsets: Some(Box::new(TextRunOffsets {
+                shared_selection: Default::default(),
+                character_range: 7..7,
+                dom_mapping: None,
+            })),
+            is_empty_for_text_cursor: true,
+        }
+    }
+
+    #[test]
+    fn caret_hit_test_bounds_are_fragment_local() {
+        // The traversal has already removed these line/column positions. Moving
+        // a fragment in its parent must not affect a point in its local space.
+        for (x, y) in [(0, 0), (80, 40), (140, 200), (-20, 100)] {
+            let fragment = caret_fragment(x, y);
+            let point = Point2D::new(Au::from_px(10), Au::from_px(10));
+            assert!(fragment.point_is_within_vertical_boundaries(point));
+            assert_eq!(
+                fragment.distance_to_point_for_glyph_offset(point),
+                Au::zero()
+            );
+
+            let point = Point2D::new(Au::from_px(90), Au::from_px(10));
+            assert!(fragment.point_is_within_vertical_boundaries(point));
+            assert_eq!(
+                fragment.distance_to_point_for_glyph_offset(point),
+                Au::from_px(10)
+            );
+        }
+    }
+
+    #[test]
+    fn caret_hit_test_below_fragment_uses_local_height() {
+        let fragment = caret_fragment(80, 200);
+        let point = Point2D::new(Au::from_px(10), Au::from_px(40));
+        assert!(!fragment.point_is_within_vertical_boundaries(point));
+        assert_eq!(fragment.character_offset(point), None);
     }
 }
