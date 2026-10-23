@@ -1,0 +1,197 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="timeout" content="long">
+<title>Native text control caret hit testing uses current local geometry</title>
+<link rel="stylesheet" href="/fonts/ahem.css">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<script src="/resources/testdriver.js"></script>
+<script src="/resources/testdriver-actions.js"></script>
+<script src="/resources/testdriver-vendor.js"></script>
+<script src="/common/rendering-utils.js"></script>
+<script src="/dom/events/scrolling/scroll_support.js"></script>
+<style>
+  #reset { position: fixed; left: 550px; top: 0; }
+  .fixture { position: absolute; left: 20px; top: 60px; }
+  textarea, input {
+    display: block; box-sizing: content-box; margin: 0; padding: 0; border: 0;
+    width: 240px; height: 100px; font: 20px/20px Ahem;
+    resize: none; overflow: auto;
+  }
+  input { height: 20px; }
+</style>
+<button id="reset">Reset click count</button>
+<script>
+'use strict';
+
+async function fixture(t, {padded = false, nested = false, scaled = false,
+                           wrapped = false, horizontal = false, input = false} = {}) {
+  await document.fonts.load('20px Ahem');
+  const container = document.createElement('div');
+  container.className = 'fixture';
+  const control = document.createElement(input ? 'input' : 'textarea');
+  control.wrap = wrapped ? 'soft' : 'off';
+  control.style.whiteSpace = wrapped ? 'pre-wrap' : 'pre';
+  const line = horizontal ? '00 ab cd ef gh ij' : '00 ab cd';
+  control.value = input ? line : wrapped ? 'abcdefghij'.repeat(50) :
+    Array.from({length: 30}, (_, row) => String(row).padStart(2, '0') + line.slice(2)).join('\n');
+  if (wrapped) control.style.wordBreak = 'break-all';
+  if (padded) {
+    control.style.padding = '9px 13px';
+    control.style.border = '7px solid black';
+  }
+  if (scaled) {
+    control.style.transform = 'scale(1.25)';
+    control.style.transformOrigin = 'top left';
+  }
+  if (nested) {
+    container.style.cssText += ';overflow:auto;width:450px;height:180px';
+    control.style.marginTop = '120px';
+    control.style.marginBottom = '200px';
+  }
+  container.append(control);
+  document.body.append(container);
+  t.add_cleanup(() => container.remove());
+  control.focus();
+  control.setSelectionRange(0, 0);
+  if (nested) container.scrollTop = 100;
+  await waitForAtLeastOneFrame();
+  return {control, container, stride: line.length + 1};
+}
+
+function point(control, x, y) {
+  const rect = control.getBoundingClientRect();
+  const style = getComputedStyle(control);
+  const scale = rect.width / control.offsetWidth;
+  return [Math.round(rect.left + scale * (parseFloat(style.borderLeftWidth) +
+                                        parseFloat(style.paddingLeft) + x)),
+          Math.round(rect.top + scale * (parseFloat(style.borderTopWidth) +
+                                       parseFloat(style.paddingTop) + y))];
+}
+
+async function resetClicks() {
+  await test_driver.click(document.getElementById('reset'));
+}
+
+async function click(control, x, y, count = 1) {
+  await resetClicks();
+  const [px, py] = point(control, x, y);
+  const actions = new test_driver.Actions().pointerMove(px, py);
+  for (let i = 0; i < count; ++i) actions.pointerDown().pointerUp();
+  await actions.send();
+}
+
+function selection(control, start, end = start) {
+  assert_equals(control.selectionStart, start, 'selectionStart at the clicked text');
+  assert_equals(control.selectionEnd, end, 'selectionEnd at the clicked text');
+}
+
+async function stableSelection(control, start, end, scrollTop, scrollLeft = 0) {
+  selection(control, start, end);
+  await waitForAtLeastOneFrame();
+  selection(control, start, end);
+  assert_approx_equals(control.scrollTop, scrollTop, 1, 'No return to the old caret row');
+  assert_approx_equals(control.scrollLeft, scrollLeft, 1, 'No return to the old caret column');
+}
+
+promise_test(async t => {
+  const {control, stride} = await fixture(t);
+  await click(control, 80, 50);
+  await stableSelection(control, 2 * stride + 4, 2 * stride + 4, 0);
+}, 'Unscrolled middle-line click uses fragment-local bounds');
+
+for (const options of [{}, {padded: true}, {nested: true, padded: true, scaled: true}]) {
+  promise_test(async t => {
+    const {control, container, stride} = await fixture(t, options);
+    // Leave the old caret offscreen, then click near the bottom of the viewport.
+    control.scrollTop = 200;
+    await waitForAtLeastOneFrame();
+    const outerScroll = container.scrollTop;
+    await click(control, 80, 65);
+    await stableSelection(control, 13 * stride + 4, 13 * stride + 4, 200);
+    assert_equals(container.scrollTop, outerScroll, 'Ancestor scroll remains stable');
+  }, `Programmatic scroll with offscreen caret: ${JSON.stringify(options)}`);
+}
+
+promise_test(async t => {
+  const {control, stride} = await fixture(t);
+  control.scrollTop = 200;
+  await waitForAtLeastOneFrame();
+  await click(control, 80, 65);
+  const programmaticIndex = control.selectionStart;
+  selection(control, 13 * stride + 4);
+  control.setSelectionRange(0, 0);
+  control.scrollTop = 0;
+  await waitForAtLeastOneFrame();
+  // Prefer scrollend, fall back to scroll-event quiescence, and bound the wait
+  // even if scrollend is advertised but not dispatched. The offset assertion
+  // below still fails if the wheel did not reach the requested position.
+  const scrolled = waitForScrollEndOrTimeout(control, 2000);
+  const [x, y] = point(control, 80, 65);
+  await new test_driver.Actions().addWheel('caret-wheel').scroll(x, y, 0, 200).send();
+  await scrolled;
+  await waitForAtLeastOneFrame();
+  assert_equals(control.scrollTop, 200, 'Wheel reaches the same scroll position');
+  await click(control, 80, 65);
+  await stableSelection(control, programmaticIndex, programmaticIndex, 200);
+}, 'Wheel and programmatic scroll give identical logical hits at identical scrollTop');
+
+promise_test(async t => {
+  const {control, stride} = await fixture(t, {horizontal: true, padded: true});
+  control.scrollTop = 200;
+  control.scrollLeft = 80;
+  await waitForAtLeastOneFrame();
+  await click(control, 40, 65);
+  await stableSelection(control, 13 * stride + 6, 13 * stride + 6, 200, 80);
+}, 'Both scroll axes are applied once to native textarea text');
+
+promise_test(async t => {
+  const {control, stride} = await fixture(t);
+  control.scrollTop = 200;
+  await waitForAtLeastOneFrame();
+  await click(control, 200, 65);
+  await stableSelection(control, 13 * stride + 8, 13 * stride + 8, 200);
+}, 'Trailing empty space chooses the end of the visually targeted line');
+
+promise_test(async t => {
+  const {control} = await fixture(t, {wrapped: true});
+  const style = getComputedStyle(control);
+  const width = control.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const columns = Math.floor(width / 20);
+  assert_greater_than(columns, 4, 'Fixture has enough columns');
+  control.scrollTop = 200;
+  await waitForAtLeastOneFrame();
+  await click(control, width - 1, 50);
+  // Twelve preceding visual rows, then the insertion point after this row.
+  await stableSelection(control, 13 * columns, 13 * columns, 200);
+}, 'Click after the final character of a scrolled wrapped visual line');
+
+for (const count of [2, 3]) {
+  promise_test(async t => {
+    const {control, stride} = await fixture(t, {padded: true});
+    control.scrollTop = 200;
+    await waitForAtLeastOneFrame();
+    const details = [];
+    control.addEventListener('mousedown', event => {
+      details.push(event.detail);
+      // A changed selection between clicks must not replace the current hit.
+      // Mouse coordinates and default event handling are left intact.
+      if (event.detail > 1) control.setSelectionRange(0, 0);
+    });
+    await click(control, 70, 65, count);
+    assert_array_equals(details, Array.from({length: count}, (_, i) => i + 1));
+    const start = 13 * stride + (count === 2 ? 3 : 0);
+    const end = 13 * stride + (count === 2 ? 5 : 8);
+    await stableSelection(control, start, end, 200);
+  }, `${count}-click selection resolves the current mouse point after scrolling`);
+}
+
+promise_test(async t => {
+  const {control} = await fixture(t, {input: true, padded: true});
+  await click(control, 80, 10);
+  selection(control, 4);
+  await test_driver.send_keys(control, 'X');
+  assert_equals(control.value, '00 aXb cd', 'Typing uses the clicked insertion point');
+  selection(control, 5);
+}, 'Single-line input hit testing and subsequent native typing remain intact');
+</script>
