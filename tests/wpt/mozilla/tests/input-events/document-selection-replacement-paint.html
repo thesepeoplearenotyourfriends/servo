@@ -1,0 +1,38 @@
+<!doctype html>
+<html class="reftest-wait">
+<meta charset="utf-8">
+<title>Replacing a wrapped nested selection removes every old highlight</title>
+<link rel="match" href="document-selection-replacement-paint-ref.html">
+<link rel="stylesheet" href="/fonts/ahem.css">
+<script src="/common/reftest-wait.js"></script>
+<script src="/common/rendering-utils.js"></script>
+<style>
+  body { margin: 0; }
+  p { margin: 0; width: 7ch; font: 20px/24px Ahem; }
+  ::selection { background: rgb(176, 214, 255); }
+</style>
+<p id="old">abc <span>def <b>ghi</b> jkl</span></p>
+<p id="current">mno pqr</p>
+<script>
+document.fonts.ready.then(async () => {
+  const selection = getSelection();
+  const old = document.getElementById('old');
+  const current = document.getElementById('current').firstChild;
+  const range = document.createRange();
+  range.selectNodeContents(old);
+  selection.addRange(range);
+  // Give the old range a rendering opportunity. The runner's final screenshot
+  // waits for the completed scene; rAF alone does not acknowledge presentation.
+  await waitForAtLeastOneFrame();
+  selection.removeAllRanges();
+  range.setStart(current, 4);
+  range.setEnd(current, 7);
+  selection.addRange(range);
+  failIfNot(selection.toString() === 'pqr' && selection.rangeCount === 1 &&
+            selection.anchorNode === current && selection.anchorOffset === 4 &&
+            selection.focusNode === current && selection.focusOffset === 7,
+            'Replacement DOM range');
+  takeScreenshot();
+});
+</script>
+</html>

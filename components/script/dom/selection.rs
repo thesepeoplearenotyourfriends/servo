@@ -113,7 +113,9 @@ impl Selection {
                         next = traversal.next_skipping_subtree();
                     }
                 },
-                PrePostIteration::Leave(_) => {},
+                // Skipping an unflagged subtree also returns a Leave event. Keep
+                // walking so that later selected siblings are cleared as well.
+                PrePostIteration::Leave(_) => next = traversal.next(),
             }
         }
     }

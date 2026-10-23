@@ -81,3 +81,5 @@ The visible runtime bridge is not a loader-map resource destination. The headed 
 ## Native document selection
 
 Document mouse selection is a script/layout interaction and does not acquire resources. It uses the existing DOM range, glyph-offset queries, selection painting, and trusted embedder clipboard action. Package URL resolution and transport denials are unchanged. See [native-document-selection.md](native-document-selection.md) for upstream provenance, regression targets, the local fixture, and outstanding build/GUI validation.
+
+Visible-selection cleanup must advance through both entry and exit events of the flat-tree traversal, including exits returned when skipping an unselected subtree. Stopping on an exit leaves later text flags and cached selection fragments stale; the existing text-node damage path rebuilds those fragments once cleanup reaches them.
