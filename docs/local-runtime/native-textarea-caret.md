@@ -31,6 +31,8 @@ The concrete configuration distinction established locally is between parent-rel
 
 These are source/isolated-test receipts. The new full-engine unit tests and WPT cases have **not run** in this session. The selected cloud workspace has no warm Servo target or runtime executable. GitHub workflow dispatch is unavailable in the connector, and a shell GitHub API check with network permission returns `Forbidden`; no warm build/test run was dispatched. No cold script/layout/workspace build was attempted.
 
+Pre-run harness correction: the wheel source is explicitly named `caret-wheel` because this bundled Actions builder throws for unnamed `addWheel()`. The test uses the existing `/dom/events/scrolling/scroll_support.js` helper `waitForScrollEndOrTimeout(control, 2000)`, registered before dispatch, then a rendering opportunity and the exact offset assertion. This handles absent support and bounds the wait when an advertised event never arrives. A Node check of the actual bundled action/scroll/rendering helpers and the WPT's wheel block reproduces the original exception and passes four cases: dispatched scrollend, unsupported scrollend with quiescence fallback, advertised-but-absent scrollend with bounded fallback, and no wheel scroll producing a bounded assertion failure. WPT lint and JavaScript syntax checks pass. This corrects the test harness only and is not a browser-execution receipt.
+
 Use the existing **Warm Debian 12 Command** workflow on the updated PR #55 branch with one integrated pass:
 
 ```sh

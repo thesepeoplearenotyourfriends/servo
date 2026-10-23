@@ -9,6 +9,7 @@
 <script src="/resources/testdriver-actions.js"></script>
 <script src="/resources/testdriver-vendor.js"></script>
 <script src="/common/rendering-utils.js"></script>
+<script src="/dom/events/scrolling/scroll_support.js"></script>
 <style>
   #reset { position: fixed; left: 550px; top: 0; }
   .fixture { position: absolute; left: 20px; top: 60px; }
@@ -122,10 +123,14 @@ promise_test(async t => {
   control.setSelectionRange(0, 0);
   control.scrollTop = 0;
   await waitForAtLeastOneFrame();
-  const scrolled = new Promise(resolve => control.addEventListener('scrollend', resolve, {once: true}));
+  // Prefer scrollend, fall back to scroll-event quiescence, and bound the wait
+  // even if scrollend is advertised but not dispatched. The offset assertion
+  // below still fails if the wheel did not reach the requested position.
+  const scrolled = waitForScrollEndOrTimeout(control, 2000);
   const [x, y] = point(control, 80, 65);
-  await new test_driver.Actions().addWheel().scroll(x, y, 0, 200).send();
+  await new test_driver.Actions().addWheel('caret-wheel').scroll(x, y, 0, 200).send();
   await scrolled;
+  await waitForAtLeastOneFrame();
   assert_equals(control.scrollTop, 200, 'Wheel reaches the same scroll position');
   await click(control, 80, 65);
   await stableSelection(control, programmaticIndex, programmaticIndex, 200);
