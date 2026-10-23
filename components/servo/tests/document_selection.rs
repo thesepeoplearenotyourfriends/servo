@@ -56,6 +56,135 @@ fn copy(servo_test: &ServoTest, webview: &WebView, clipboard: &Rc<ClipboardRecor
         .expect("Copy did not reach the clipboard delegate")
 }
 
+// Unlike rAF, this waits for an up-to-date WebRender scene with no pending frames.
+fn scene_pixels(servo_test: &ServoTest, webview: &WebView) -> Vec<u8> {
+    let pixels = Rc::new(RefCell::new(None));
+    let captured = pixels.clone();
+    webview.take_screenshot(None, move |result| {
+        *captured.borrow_mut() = Some(result.expect("Selection screenshot failed").into_raw());
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let waiting = pixels.clone();
+    servo_test.spin(move || waiting.borrow().is_none() && Instant::now() < deadline);
+    pixels
+        .borrow_mut()
+        .take()
+        .expect("Selection scene timed out")
+}
+
+#[test]
+fn document_selection_replacement_collapse_and_clear_remove_old_pixels() {
+    let servo_test = ServoTest::new();
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+    let clipboard = Rc::new(ClipboardRecorder::default());
+    let url = Url::parse(concat!(
+        "data:text/html,<!doctype html><style>",
+        "body,p{margin:0}p{width:12ch;font:20px/24px monospace}",
+        "::selection{background:rgb(176,214,255)}</style>",
+        "<p id=one>alpha bravo charlie delta</p>",
+        "<p id=wrapped>echo <span>foxtrot <b>golf hotel</b> india</span> juliet</p>",
+        "<p id=last>kilo lima november</p>",
+        "<script>",
+        "function select(start, a, end, b) {",
+        "const r = document.createRange(); r.setStart(start,a); r.setEnd(end,b);",
+        "getSelection().removeAllRanges(); getSelection().addRange(r);}",
+        "const first = one.firstChild, final = last.firstChild;",
+        "function early() {select(first,0,first,5)}",
+        "function late() {select(first,20,first,25)}",
+        "function other() {select(final,5,final,9)}",
+        "function nested() {select(wrapped.firstChild,1,wrapped.lastChild,7)}",
+        "</script>"
+    ))
+    .unwrap();
+    let webview = WebViewBuilder::new(servo_test.servo(), servo_test.rendering_context.clone())
+        .delegate(delegate.clone())
+        .clipboard_delegate(clipboard.clone())
+        .url(url)
+        .build();
+    show_webview_and_wait_for_rendering_to_be_ready(&servo_test, &webview, &delegate);
+    let run = |script| evaluate_javascript(&servo_test, webview.clone(), script).unwrap();
+    let assert_selection = |expected: &str| {
+        assert_eq!(
+            run("getSelection().toString()"),
+            JSValue::String(expected.into())
+        );
+    };
+    let unselected = scene_pixels(&servo_test, &webview);
+
+    // Directly selecting B gives a pixel oracle independent of replacement.
+    run("late()");
+    let late = scene_pixels(&servo_test, &webview);
+    assert!(late != unselected, "The oracle must contain a highlight");
+    run("early()");
+    wait_for_scene(&servo_test, &webview);
+    run("late()");
+    assert_selection("delta");
+    assert!(
+        scene_pixels(&servo_test, &webview) == late,
+        "Disjoint offsets"
+    );
+    assert_eq!(copy(&servo_test, &webview, &clipboard), "delta");
+
+    run("getSelection().removeAllRanges()");
+    assert_eq!(run("getSelection().rangeCount"), JSValue::Number(0.0));
+    assert!(scene_pixels(&servo_test, &webview) == unselected, "Clear");
+    run("other()");
+    let other = scene_pixels(&servo_test, &webview);
+    assert!(other != unselected, "The oracle must contain a highlight");
+    run("early()");
+    wait_for_scene(&servo_test, &webview);
+    run("other()");
+    assert_selection("lima");
+    assert!(
+        scene_pixels(&servo_test, &webview) == other,
+        "Different nodes"
+    );
+    assert_eq!(copy(&servo_test, &webview, &clipboard), "lima");
+
+    run("getSelection().collapse(final,5)");
+    assert_eq!(run("getSelection().isCollapsed"), JSValue::Boolean(true));
+    assert!(
+        scene_pixels(&servo_test, &webview) == unselected,
+        "Collapse"
+    );
+    run("nested()");
+    assert_selection("cho foxtrot golf hotel india juliet");
+    assert!(
+        scene_pixels(&servo_test, &webview) != unselected,
+        "Nested range"
+    );
+    run("other()");
+    assert_selection("lima");
+    assert!(
+        scene_pixels(&servo_test, &webview) == other,
+        "Wrapped nested range"
+    );
+
+    // Coalesced changes, followed by changes across completed scenes.
+    run("early(); nested(); getSelection().removeAllRanges(); late(); other()");
+    assert_selection("lima");
+    assert!(
+        scene_pixels(&servo_test, &webview) == other,
+        "Coalesced changes"
+    );
+    for _ in 0..3 {
+        run("nested(); early()");
+        wait_for_scene(&servo_test, &webview);
+        run("late(); other()");
+        assert_selection("lima");
+        assert!(
+            scene_pixels(&servo_test, &webview) == other,
+            "Successive scenes"
+        );
+    }
+    run("getSelection().removeAllRanges()");
+    assert_selection("");
+    assert!(
+        scene_pixels(&servo_test, &webview) == unselected,
+        "Final clear"
+    );
+}
+
 #[test]
 fn native_document_drag_updates_selection_and_copy_preserves_text_controls() {
     let servo_test = ServoTest::new();
